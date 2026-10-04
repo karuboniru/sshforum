@@ -48,6 +48,32 @@ def wait_for_server(process: subprocess.Popen[bytes], port: int) -> None:
     raise AssertionError("server did not listen within eight seconds")
 
 
+def check_listener_nonblocking(process: subprocess.Popen[bytes], port: int) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    # Identify the actual listening socket, rather than an accepted connection.
+    proc = Path(f"/proc/{process.pid}")
+    inodes = {
+        fields[9]
+        for line in (proc / "net/tcp").read_text().splitlines()[1:]
+        if (fields := line.split())[3] == "0A"
+        and int(fields[1].split(":")[1], 16) == port
+    }
+    assert inodes, "test listener is missing from /proc/net/tcp"
+    for descriptor in (proc / "fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+            if target not in {f"socket:[{inode}]" for inode in inodes}:
+                continue
+            info = (proc / "fdinfo" / descriptor.name).read_text()
+        except FileNotFoundError:
+            continue  # An unrelated connection may have closed while scanning.
+        flags = next(line.split()[1] for line in info.splitlines() if line.startswith("flags:"))
+        assert int(flags, 8) & os.O_NONBLOCK, "listening socket can block in accept()"
+        return
+    raise AssertionError("could not find the server's listening file descriptor")
+
+
 class Server:
     def __init__(self, binary: Path, directory: Path):
         self.binary = binary
@@ -494,6 +520,21 @@ def check_identity(server: Server, marker: str, database: Path, key) -> None:
                     )
 
 
+def check_input_slices(port: int) -> None:
+    with contextlib.closing(Terminal(port, "none")) as busy:
+        with contextlib.closing(Terminal(port, "none")) as observer:
+            mark = busy.mark()
+            # One read contains more refresh commands than a processing slice.
+            # Intermediate list output proves execution yielded before reaching
+            # the editor command at the end of the batch.
+            busy.send("r" * 4095 + "n")
+            busy.wait_for("SSH Forum | Threads", mark)
+            observer.send_and_expect("n", "New thread | Title")
+            # No further input is sent: locally buffered work must keep running.
+            busy.wait_for("New thread | Title", mark)
+            busy.send_and_expect("切片标题\r正文\x1b[D!", "正!文")
+
+
 def run(binary: Path) -> None:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SystemExit(f"server binary is not executable: {binary}")
@@ -508,6 +549,7 @@ def run(binary: Path) -> None:
         server = Server(binary, directory)
         try:
             server.start()
+            check_listener_nonblocking(server.process, server.port)
             assert (directory / "host_key").is_file(), "server did not create a host key"
             key = paramiko.RSAKey.generate(2048)
             terminals = []
@@ -555,6 +597,7 @@ def run(binary: Path) -> None:
                 persisted.send_and_expect("r", reply_b)
             check_navigation(server.port, marker)
             check_editor(server.port, marker, directory / "forum.db")
+            check_input_slices(server.port)
             check_identity(server, marker, directory / "forum.db", key)
             print("SSH smoke test passed")
         except BaseException:

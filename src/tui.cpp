@@ -332,6 +332,7 @@ void Tui::submit() {
 }
 
 void Tui::key(std::string_view name) {
+    ++dispatched_keys_;
     if (name == "ctrl-c") { done_ = true; return; }
     if (page_ == Page::new_title || page_ == Page::new_body || page_ == Page::reply_body) {
         if (name == "esc") { cancel_editor(); return; }
@@ -537,9 +538,19 @@ void Tui::byte(unsigned char value) {
 }
 
 std::string Tui::input(std::string_view bytes) {
-    if (!started_ || done_) return {};
+    return input_impl(bytes, false).output;
+}
+
+Tui::InputResult Tui::input_some(std::string_view bytes) {
+    return input_impl(bytes, true);
+}
+
+Tui::InputResult Tui::input_impl(std::string_view bytes, bool bounded) {
+    if (!started_ || done_) return {{}, 0};
+    dispatched_keys_ = 0;
+    const auto started_at = std::chrono::steady_clock::now();
     if (bytes.empty() && escape_ != Escape::none) {
-        const auto elapsed = std::chrono::steady_clock::now() - escape_at_;
+        const auto elapsed = started_at - escape_at_;
         if (escape_ == Escape::esc && elapsed >= std::chrono::milliseconds(80)) {
             escape_ = Escape::none;
             key("esc");
@@ -548,13 +559,21 @@ std::string Tui::input(std::string_view bytes) {
             escape_data_.clear();
         }
     }
+    std::size_t consumed = 0;
     for (unsigned char value : bytes) {
+        if (bounded && consumed > 0 &&
+            (dispatched_keys_ >= 32 ||
+             // A pending Escape can dispatch both Escape and this byte's key.
+             (dispatched_keys_ == 31 && escape_ == Escape::esc) ||
+             std::chrono::steady_clock::now() - started_at >= std::chrono::milliseconds(2)))
+            break;
         byte(value);
+        ++consumed;
         if (done_) break;
     }
-    if (done_) return restore_terminal();
-    if (!dirty_) return {};
-    return render();
+    if (done_) return {restore_terminal(), consumed};
+    if (!dirty_) return {{}, consumed};
+    return {render(), consumed};
 }
 
 std::string Tui::render() {

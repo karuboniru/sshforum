@@ -467,6 +467,73 @@ void test_middle_insertion_byte_limits() {
             "body insertion at byte limit should preserve UTF-8 boundaries");
 }
 
+void test_bounded_input_and_parser_state() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    sshforum::Tui tui(store);
+    tui.start();
+
+    const std::string commands = std::string(100, 'r') + "n";
+    auto result = tui.input_some(commands);
+    require(result.consumed > 0 && result.consumed <= 32,
+            "a bounded call should process at most 32 refresh commands");
+    require(result.output.find("SSH Forum | Threads") != std::string::npos,
+            "a bounded refresh batch should render its final list state");
+    std::size_t consumed = result.consumed;
+    while (consumed < commands.size()) {
+        result = tui.input_some(std::string_view(commands).substr(consumed));
+        require(result.consumed > 0 && result.consumed <= 32,
+                "each bounded call should make progress without passing the command budget");
+        consumed += result.consumed;
+    }
+    require(result.output.find("New thread | Title") != std::string::npos,
+            "unconsumed input should resume at the exact command boundary");
+
+    const auto feed = [&](std::string_view bytes) {
+        std::string output;
+        for (std::size_t at = 0; at < bytes.size();) {
+            const auto part = tui.input_some(bytes.substr(at));
+            require(part.consumed > 0, "bounded input should make progress on nonempty input");
+            at += part.consumed;
+            if (!part.output.empty()) output = part.output;
+        }
+        return output;
+    };
+    feed("T\r");
+    feed("a\xe4");
+    feed("\xb8");
+    feed("\xad" "b");
+    feed("\x1b");
+    feed("[");
+    feed("D");
+    feed("X\x1b[C\r");
+    feed("\n" "z");
+    const auto submitted = feed("\x04");
+    require(submitted.find("a中Xb") != std::string::npos,
+            "bounded input should render the submitted draft");
+    const auto latest = store.list_threads().front();
+    require(latest.title == "T" && latest.body == "a中Xb\nz",
+            "bounded calls should preserve split UTF-8, Escape, and CRLF state");
+
+    feed("a");
+    feed("draft");
+    feed("\x1b");
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+    require(tui.input_some("").output.find("Cancelled") != std::string::npos,
+            "an empty bounded call should resolve a timed-out lone Escape");
+    const std::string exit_commands = "bqextra";
+    std::size_t exit_consumed = 0;
+    std::string exit_output;
+    while (exit_consumed < exit_commands.size() && !tui.done()) {
+        const auto part = tui.input_some(std::string_view(exit_commands).substr(exit_consumed));
+        require(part.consumed > 0, "bounded input should progress toward quit");
+        exit_consumed += part.consumed;
+        if (!part.output.empty()) exit_output = part.output;
+    }
+    require(exit_consumed == 2 && exit_output == sshforum::Tui::restore_terminal(),
+            "bounded input should stop exactly at the quit command");
+}
+
 } // namespace
 
 int main() {
@@ -479,4 +546,5 @@ int main() {
     test_cursor_editing_and_reply();
     test_wrap_viewport_and_resize();
     test_middle_insertion_byte_limits();
+    test_bounded_input_and_parser_state();
 }

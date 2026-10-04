@@ -17,11 +17,13 @@
 #include <chrono>
 #include <csignal>
 #include <filesystem>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <sys/stat.h>
 #include <type_traits>
 #include <vector>
@@ -179,6 +181,9 @@ public:
         if (ssh_get_poll_flags(session()) & SSH_WRITE_PENDING) events |= POLLOUT;
         return {ssh_get_fd(session()), events, 0};
     }
+    bool has_buffered_input() const {
+        return !input_.empty() && pending_.size() < 256 * 1024 && !tui_.done();
+    }
 private:
     static int authenticate(void* data, const char* username,
                             std::string_view method, std::string_view credential) noexcept {
@@ -240,17 +245,20 @@ private:
                 tui_.resize(width_, height_);
                 resized_ = false;
             }
-            // Bound work and buffered output per tick so a busy peer cannot
-            // monopolize the loop. SQLite operations are deliberately synchronous.
+            // Keep at most one read buffered and process only a bounded amount
+            // of input before yielding. SQLite operations remain synchronous.
             if (pending_.size() < 256 * 1024) {
-                const int count = ssh_channel_read_nonblocking(channel_, buffer.data(), buffer.size(), 0);
-                if (count == SSH_ERROR) co_return;
-                if (count > 0) {
-                    last_input = Clock::now();
-                    enqueue(tui_.input(std::string_view(buffer.data(), static_cast<std::size_t>(count))));
-                } else {
-                    enqueue(tui_.input(""));
+                if (input_.empty()) {
+                    const int count = ssh_channel_read_nonblocking(channel_, buffer.data(), buffer.size(), 0);
+                    if (count == SSH_ERROR) co_return;
+                    if (count > 0) {
+                        last_input = Clock::now();
+                        input_.assign(buffer.data(), static_cast<std::size_t>(count));
+                    }
                 }
+                auto input = tui_.input_some(input_);
+                input_.erase(0, input.consumed);
+                enqueue(std::move(input.output));
             }
             if (!flush() || Clock::now() - last_input > 30min) co_return;
             co_await std::suspend_always{};
@@ -293,6 +301,7 @@ private:
     const std::string& identity_secret_;
     std::string peer_ip_;
     std::string pending_;
+    std::string input_;
     Clock::time_point last_write_{};
     Task task_;
 };
@@ -323,6 +332,12 @@ int run_server(const ServerOptions& options) {
     if (ssh_bind_listen(listener.get()) != SSH_OK)
         throw std::runtime_error(ssh_get_error(listener.get()));
     ssh_bind_set_blocking(listener.get(), 0);
+    // libssh's blocking flag does not set O_NONBLOCK on the listening socket.
+    // Readiness can disappear before accept(), so the fd itself must not block.
+    const int listener_fd = ssh_bind_get_fd(listener.get());
+    const int listener_flags = fcntl(listener_fd, F_GETFL);
+    if (listener_flags == -1 || fcntl(listener_fd, F_SETFL, listener_flags | O_NONBLOCK) == -1)
+        throw std::system_error(errno, std::generic_category(), "set listener nonblocking");
     std::cout << "sshforum listening on " << options.bind << ':' << options.port
               << " | anonymous access | SQLite: " << options.database << std::endl;
 
@@ -332,8 +347,12 @@ int run_server(const ServerOptions& options) {
         descriptors.reserve(connections.size() + 1);
         descriptors.push_back({ssh_bind_get_fd(listener.get()), POLLIN, 0});
         for (const auto& connection : connections) descriptors.push_back(connection->descriptor());
-        // A bounded timer also services escape-key disambiguation and deadlines.
-        const int ready = poll(descriptors.data(), descriptors.size(), 50);
+        // Buffered input is runnable without a new socket event. Still poll and
+        // tick every connection between slices to give other sessions a turn.
+        // The idle timer also services escape-key disambiguation and deadlines.
+        const bool runnable = std::any_of(connections.begin(), connections.end(),
+            [](const auto& connection) { return connection->has_buffered_input(); });
+        const int ready = poll(descriptors.data(), descriptors.size(), runnable ? 0 : 50);
         if (ready < 0 && errno != EINTR) throw std::runtime_error("poll failed");
         if (stopping) break;
         if (ready > 0 && (descriptors.front().revents & POLLIN)) {

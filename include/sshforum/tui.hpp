@@ -13,12 +13,19 @@ namespace sshforum {
 
 class Tui {
 public:
+    struct InputResult {
+        std::string output;
+        std::size_t consumed;
+    };
+
     explicit Tui(Store& store);
 
     void set_author_id(std::string author_id);
     void resize(int width, int height);
     std::string start();
     std::string input(std::string_view bytes);
+    // Resume with bytes.substr(consumed); individual commands and rendering finish atomically.
+    InputResult input_some(std::string_view bytes);
     bool done() const noexcept { return done_; }
     static std::string restore_terminal();
 
@@ -40,6 +47,7 @@ private:
     bool started_ = false;
     bool done_ = false;
     bool dirty_ = true;
+    std::size_t dispatched_keys_ = 0;
     std::vector<ThreadSummary> threads_;
     int selected_ = 0;
     int list_top_ = 0;
@@ -59,6 +67,7 @@ private:
     void key(std::string_view name);
     void character(std::string_view utf8);
     void byte(unsigned char value);
+    InputResult input_impl(std::string_view bytes, bool bounded);
     void submit();
     void cancel_editor();
     void show_thread(std::int64_t id);
