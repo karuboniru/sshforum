@@ -1,0 +1,439 @@
+#include "sshforum/tui.hpp"
+
+#include <algorithm>
+#include <cstddef>
+#include <exception>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace sshforum {
+namespace {
+
+// Only validated printable Unicode reaches the screen. In particular, a value
+// read from the database cannot inject an ANSI control sequence.
+bool decode(std::string_view text, std::size_t& at, char32_t& cp, std::string_view& bytes) {
+    if (at >= text.size()) return false;
+    const std::size_t start = at;
+    const auto first = static_cast<unsigned char>(text[at++]);
+    int count = 0;
+    if (first < 0x80) cp = first;
+    else if (first >= 0xc2 && first <= 0xdf) { cp = first & 0x1f; count = 1; }
+    else if (first >= 0xe0 && first <= 0xef) { cp = first & 0x0f; count = 2; }
+    else if (first >= 0xf0 && first <= 0xf4) { cp = first & 0x07; count = 3; }
+    else return false;
+    if (at + static_cast<std::size_t>(count) > text.size()) return false;
+    for (int i = 0; i < count; ++i) {
+        const auto next = static_cast<unsigned char>(text[at]);
+        if ((next & 0xc0) != 0x80) return false;
+        cp = (cp << 6) | (next & 0x3f);
+        ++at;
+    }
+    if ((count == 1 && cp < 0x80) || (count == 2 && cp < 0x800) ||
+        (count == 3 && cp < 0x10000) || (cp >= 0xd800 && cp <= 0xdfff) ||
+        cp > 0x10ffff) return false;
+    bytes = text.substr(start, at - start);
+    return true;
+}
+
+bool printable(char32_t cp) {
+    return cp >= 0x20 && cp != 0x7f && !(cp >= 0x80 && cp <= 0x9f) &&
+           cp != 0x2028 && cp != 0x2029;
+}
+
+int cells(char32_t cp) {
+    if ((cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1ab0 && cp <= 0x1aff) ||
+        (cp >= 0x1dc0 && cp <= 0x1dff) || (cp >= 0x20d0 && cp <= 0x20ff) ||
+        (cp >= 0xfe20 && cp <= 0xfe2f)) return 0;
+    if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2329 && cp <= 0x232a) ||
+        (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+        (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe19) ||
+        (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) ||
+        (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) ||
+        (cp >= 0x20000 && cp <= 0x3fffd)) return 2;
+    return 1;
+}
+
+std::string fit(std::string_view source, int width) {
+    std::string out;
+    int used = 0;
+    for (std::size_t at = 0; at < source.size();) {
+        char32_t cp = 0;
+        std::string_view bytes;
+        if (!decode(source, at, cp, bytes)) continue;
+        if (cp == '\n' || cp == '\r' || cp == '\t') {
+            if (used >= width) break;
+            out.push_back(' ');
+            ++used;
+        } else if (printable(cp)) {
+            const int size = cells(cp);
+            if (used + size > width) break;
+            out.append(bytes);
+            used += size;
+        }
+    }
+    return out;
+}
+
+void wrapped(std::vector<std::string>& lines, std::string_view source, int width,
+             std::string_view prefix = {}) {
+    if (lines.size() >= 100000) return;
+    std::string line = fit(prefix, width);
+    const int prefix_width = static_cast<int>(line.size()); // ASCII prefixes only.
+    int used = prefix_width;
+    bool had = false;
+    for (std::size_t at = 0; at < source.size();) {
+        char32_t cp = 0;
+        std::string_view bytes;
+        if (!decode(source, at, cp, bytes)) continue;
+        if (cp == '\n') {
+            lines.push_back(std::move(line));
+            if (lines.size() >= 100000) return;
+            line.clear();
+            used = 0;
+            had = true;
+            continue;
+        }
+        if (cp == '\r' || cp == '\t') { cp = ' '; bytes = " "; }
+        if (!printable(cp)) continue;
+        const int size = cells(cp);
+        if (used + size > width && used > 0) {
+            lines.push_back(std::move(line));
+            if (lines.size() >= 100000) return;
+            line.clear();
+            used = 0;
+        }
+        if (size > width) continue;
+        line.append(bytes);
+        used += size;
+        had = true;
+    }
+    if (had || !line.empty()) lines.push_back(std::move(line));
+    else lines.emplace_back();
+}
+
+void erase_last(std::string& value) {
+    if (value.empty()) return;
+    std::size_t at = value.size() - 1;
+    while (at > 0 && (static_cast<unsigned char>(value[at]) & 0xc0) == 0x80) --at;
+    value.erase(at);
+}
+
+} // namespace
+
+Tui::Tui(Store& store) : store_(store) {}
+
+void Tui::resize(int width, int height) {
+    width_ = std::clamp(width, 1, 400);
+    height_ = std::clamp(height, 1, 200);
+    dirty_ = true;
+}
+
+std::string Tui::restore_terminal() {
+    return "\x1b[?25h\x1b[?1049l";
+}
+
+void Tui::refresh_list() {
+    try {
+        const std::int64_t selected_id = selected_ >= 0 &&
+            selected_ < static_cast<int>(threads_.size()) ? threads_[selected_].id : 0;
+        threads_ = store_.list_threads();
+        selected_ = std::clamp(selected_, 0, std::max(0, static_cast<int>(threads_.size()) - 1));
+        for (int i = 0; i < static_cast<int>(threads_.size()); ++i) {
+            if (threads_[i].id == selected_id) { selected_ = i; break; }
+        }
+        status_.clear();
+    } catch (const std::exception& error) {
+        status_ = std::string("Error: ") + error.what();
+    } catch (...) {
+        status_ = "Error loading threads";
+    }
+    dirty_ = true;
+}
+
+void Tui::refresh_thread() {
+    try {
+        auto loaded = store_.get_thread(thread_id_);
+        if (loaded) {
+            thread_ = std::move(*loaded);
+            status_.clear();
+        } else {
+            status_ = "Thread no longer exists";
+            page_ = Page::list;
+            refresh_list();
+            status_ = "Thread no longer exists";
+        }
+    } catch (const std::exception& error) {
+        status_ = std::string("Error: ") + error.what();
+    } catch (...) {
+        status_ = "Error loading thread";
+    }
+    dirty_ = true;
+}
+
+void Tui::show_thread(std::int64_t id) {
+    thread_id_ = id;
+    thread_scroll_ = 0;
+    page_ = Page::thread;
+    refresh_thread();
+}
+
+std::string Tui::start() {
+    if (done_) return {};
+    if (!started_) {
+        started_ = true;
+        refresh_list();
+        return std::string("\x1b[?1049h\x1b[?25l") + render();
+    }
+    return render();
+}
+
+void Tui::cancel_editor() {
+    draft_title_.clear();
+    draft_body_.clear();
+    page_ = thread_id_ && page_ == Page::reply_body ? Page::thread : Page::list;
+    status_ = "Cancelled";
+    dirty_ = true;
+}
+
+void Tui::submit() {
+    if (draft_body_.empty()) { status_ = "Body is empty"; dirty_ = true; return; }
+    try {
+        if (page_ == Page::new_body) {
+            const auto id = store_.create_thread(draft_title_, draft_body_);
+            draft_title_.clear();
+            draft_body_.clear();
+            show_thread(id);
+            if (page_ == Page::thread) status_ = "Thread posted";
+        } else if (page_ == Page::reply_body) {
+            store_.reply(thread_id_, draft_body_);
+            draft_body_.clear();
+            page_ = Page::thread;
+            refresh_thread();
+            thread_scroll_ = 100000;
+            if (page_ == Page::thread) status_ = "Reply posted";
+        }
+    } catch (const std::exception& error) {
+        status_ = std::string("Error: ") + error.what();
+    } catch (...) {
+        status_ = "Error saving post";
+    }
+    dirty_ = true;
+}
+
+void Tui::key(std::string_view name) {
+    if (name == "ctrl-c") { done_ = true; return; }
+    if (page_ == Page::new_title || page_ == Page::new_body || page_ == Page::reply_body) {
+        if (name == "esc") { cancel_editor(); return; }
+        if (name == "backspace") {
+            erase_last(page_ == Page::new_title ? draft_title_ : draft_body_);
+            dirty_ = true;
+        } else if (name == "enter") {
+            if (page_ == Page::new_title) {
+                if (draft_title_.empty()) status_ = "Title is empty";
+                else { page_ = Page::new_body; status_.clear(); }
+            } else if (draft_body_.size() < 16384) draft_body_.push_back('\n');
+            else status_ = "Body limit: 16384 bytes";
+            dirty_ = true;
+        } else if (name == "ctrl-d" && page_ != Page::new_title) submit();
+        return;
+    }
+    if (page_ == Page::list) {
+        if (name == "q") done_ = true;
+        else if (name == "up" || name == "k") {
+            selected_ = std::max(0, selected_ - 1); dirty_ = true;
+        } else if (name == "down" || name == "j") {
+            selected_ = std::min(std::max(0, static_cast<int>(threads_.size()) - 1), selected_ + 1);
+            dirty_ = true;
+        } else if (name == "enter") {
+            if (!threads_.empty()) show_thread(threads_[selected_].id);
+        } else if (name == "n") {
+            page_ = Page::new_title; draft_title_.clear(); draft_body_.clear();
+            status_.clear(); dirty_ = true;
+        } else if (name == "r") refresh_list();
+        else if (name == "page-up") {
+            selected_ = std::max(0, selected_ - std::max(1, height_ - 2)); dirty_ = true;
+        } else if (name == "page-down") {
+            selected_ = std::min(std::max(0, static_cast<int>(threads_.size()) - 1),
+                                 selected_ + std::max(1, height_ - 2)); dirty_ = true;
+        }
+    } else if (page_ == Page::thread) {
+        if (name == "up" || name == "k") { thread_scroll_ = std::max(0, thread_scroll_ - 1); dirty_ = true; }
+        else if (name == "down" || name == "j") { thread_scroll_ = std::min(100000, thread_scroll_ + 1); dirty_ = true; }
+        else if (name == "page-up") { thread_scroll_ = std::max(0, thread_scroll_ - std::max(1, height_ - 2)); dirty_ = true; }
+        else if (name == "page-down") { thread_scroll_ = std::min(100000, thread_scroll_ + std::max(1, height_ - 2)); dirty_ = true; }
+        else if (name == "b") { page_ = Page::list; refresh_list(); }
+        else if (name == "r") refresh_thread();
+        else if (name == "a") { page_ = Page::reply_body; draft_body_.clear(); status_.clear(); dirty_ = true; }
+    }
+}
+
+void Tui::character(std::string_view utf8) {
+    if (page_ == Page::new_title) {
+        if (draft_title_.size() + utf8.size() <= 120) {
+            draft_title_.append(utf8); status_.clear(); dirty_ = true;
+        } else { status_ = "Title limit: 120 bytes"; dirty_ = true; }
+    } else if (page_ == Page::new_body || page_ == Page::reply_body) {
+        if (draft_body_.size() + utf8.size() <= 16384) {
+            draft_body_.append(utf8); status_.clear(); dirty_ = true;
+        } else { status_ = "Body limit: 16384 bytes"; dirty_ = true; }
+    } else if (utf8.size() == 1) key(utf8);
+}
+
+void Tui::byte(unsigned char value) {
+    if (value != '\r' && value != '\n') last_was_cr_ = false;
+    if (escape_ == Escape::esc) {
+        if (value == '[') {
+            escape_ = Escape::csi; escape_data_.clear();
+            escape_at_ = std::chrono::steady_clock::now(); return;
+        }
+        if (value == 'O') {
+            escape_ = Escape::ss3; escape_data_.clear();
+            escape_at_ = std::chrono::steady_clock::now(); return;
+        }
+        escape_ = Escape::none;
+        key("esc");
+    } else if (escape_ == Escape::csi || escape_ == Escape::ss3) {
+        if (value >= 0x40 && value <= 0x7e) {
+            escape_data_.push_back(static_cast<char>(value));
+            const auto sequence = escape_data_;
+            escape_data_.clear();
+            escape_ = Escape::none;
+            if (sequence == "A") key("up");
+            else if (sequence == "B") key("down");
+            else if (sequence == "5~") key("page-up");
+            else if (sequence == "6~") key("page-down");
+            return;
+        }
+        if (value < 0x20 || value > 0x3f || escape_data_.size() >= 32) {
+            escape_ = Escape::none; escape_data_.clear(); return;
+        }
+        escape_data_.push_back(static_cast<char>(value));
+        escape_at_ = std::chrono::steady_clock::now();
+        return;
+    }
+    if (value == 0x1b) {
+        utf8_pending_.clear(); utf8_expected_ = 0;
+        escape_ = Escape::esc;
+        escape_at_ = std::chrono::steady_clock::now();
+        return;
+    }
+    if (value < 0x20 || value == 0x7f) {
+        utf8_pending_.clear(); utf8_expected_ = 0;
+        if (value == 0x03) key("ctrl-c");
+        else if (value == 0x04) key("ctrl-d");
+        else if (value == '\r') { key("enter"); last_was_cr_ = true; }
+        else if (value == '\n') { if (!last_was_cr_) key("enter"); last_was_cr_ = false; }
+        else if (value == 0x08 || value == 0x7f) key("backspace");
+        return;
+    }
+    if (utf8_expected_ > 0) {
+        if ((value & 0xc0) == 0x80) {
+            utf8_pending_.push_back(static_cast<char>(value));
+            if (static_cast<int>(utf8_pending_.size()) == utf8_expected_) {
+                std::size_t at = 0; char32_t cp = 0; std::string_view bytes;
+                if (decode(utf8_pending_, at, cp, bytes) && printable(cp)) character(bytes);
+                utf8_pending_.clear(); utf8_expected_ = 0;
+            }
+            return;
+        }
+        utf8_pending_.clear(); utf8_expected_ = 0;
+    }
+    if (value < 0x80) character(std::string_view(reinterpret_cast<const char*>(&value), 1));
+    else if (value >= 0xc2 && value <= 0xdf) { utf8_pending_ = static_cast<char>(value); utf8_expected_ = 2; }
+    else if (value >= 0xe0 && value <= 0xef) { utf8_pending_ = static_cast<char>(value); utf8_expected_ = 3; }
+    else if (value >= 0xf0 && value <= 0xf4) { utf8_pending_ = static_cast<char>(value); utf8_expected_ = 4; }
+}
+
+std::string Tui::input(std::string_view bytes) {
+    if (!started_ || done_) return {};
+    if (bytes.empty() && escape_ != Escape::none) {
+        const auto elapsed = std::chrono::steady_clock::now() - escape_at_;
+        if (escape_ == Escape::esc && elapsed >= std::chrono::milliseconds(80)) {
+            escape_ = Escape::none;
+            key("esc");
+        } else if (escape_ != Escape::esc && elapsed >= std::chrono::seconds(1)) {
+            escape_ = Escape::none;
+            escape_data_.clear();
+        }
+    }
+    for (unsigned char value : bytes) {
+        byte(value);
+        if (done_) break;
+    }
+    if (done_) return restore_terminal();
+    if (!dirty_) return {};
+    return render();
+}
+
+std::string Tui::render() {
+    dirty_ = false;
+    const int content_width = std::max(0, width_ - 1); // Avoid terminal auto-wrap.
+    const int content_height = std::max(0, height_ - 2);
+    std::string header;
+    std::string footer;
+    std::vector<std::string> content;
+    if (page_ == Page::list) {
+        header = "SSH Forum | Threads (" + std::to_string(threads_.size()) + ")";
+        footer = "j/k: move  PgUp/PgDn: page  Enter: open  n: new  r: refresh  q: quit";
+        if (threads_.empty()) content.emplace_back("No threads yet. Press n to post.");
+        else {
+            if (selected_ < list_top_) list_top_ = selected_;
+            if (selected_ >= list_top_ + std::max(1, content_height))
+                list_top_ = selected_ - std::max(1, content_height) + 1;
+            for (int i = list_top_; i < static_cast<int>(threads_.size()) &&
+                 static_cast<int>(content.size()) < content_height; ++i) {
+                const auto& item = threads_[i];
+                content.push_back(std::string(i == selected_ ? "> " : "  ") +
+                                  item.title + "  [" + std::to_string(item.reply_count) + " replies]");
+            }
+        }
+    } else if (page_ == Page::thread) {
+        header = "SSH Forum | Thread #" + std::to_string(thread_id_);
+        footer = "j/k: scroll  PgUp/PgDn: page  a: reply  r: refresh  b: back";
+        wrapped(content, thread_.summary.title, content_width);
+        wrapped(content, "Posted: " + thread_.summary.created_at, content_width);
+        wrapped(content, "Last reply: " + (thread_.replies.empty()
+            ? std::string("No replies yet") : thread_.replies.back().created_at), content_width);
+        content.emplace_back("Anonymous");
+        content.emplace_back();
+        wrapped(content, thread_.summary.body, content_width);
+        content.emplace_back();
+        for (const auto& reply : thread_.replies) {
+            if (content.size() >= 100000) break;
+            wrapped(content, "Anonymous  Reply #" + std::to_string(reply.id), content_width);
+            wrapped(content, "Posted: " + reply.created_at, content_width);
+            wrapped(content, reply.body, content_width);
+            content.emplace_back();
+        }
+        thread_scroll_ = std::clamp(thread_scroll_, 0,
+            std::max(0, static_cast<int>(content.size()) - content_height));
+        if (thread_scroll_ > 0) content.erase(content.begin(), content.begin() + thread_scroll_);
+    } else {
+        const bool title = page_ == Page::new_title;
+        header = title ? "New thread | Title" :
+                 page_ == Page::new_body ? "New thread | Body" : "Reply | Body";
+        footer = title ? "Enter: next  Esc: cancel  Max 120 bytes" :
+                  "Enter: newline  Ctrl+D: submit  Esc: cancel  Max 16384 bytes";
+        if (title) wrapped(content, draft_title_ + "_", content_width);
+        else wrapped(content, draft_body_ + "_", content_width);
+        if (static_cast<int>(content.size()) > content_height && content_height > 0)
+            content.erase(content.begin(), content.end() - content_height);
+    }
+    if (!status_.empty()) footer = status_ + " | " + footer;
+    std::string screen = "\x1b[H\x1b[2J";
+    for (int row = 0; row < height_; ++row) {
+        std::string_view source;
+        if (row == 0) source = header;
+        else if (row == height_ - 1 && height_ > 1) source = footer;
+        else if (row - 1 >= 0 && row - 1 < static_cast<int>(content.size()) &&
+                 row - 1 < content_height) source = content[row - 1];
+        screen += fit(source, content_width);
+        screen += "\x1b[K";
+        if (row + 1 < height_) screen += "\r\n";
+    }
+    return screen;
+}
+
+} // namespace sshforum

@@ -1,0 +1,68 @@
+[Unit]
+Description=Anonymous SSH forum
+After=network.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+RemoveIPC=yes
+KeyringMode=private
+StateDirectory=sshforum
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/sshforum
+UMask=0077
+
+# Override these with Environment= in a service drop-in. If the port changes,
+# update SocketBindAllow= in the same drop-in as well.
+Environment=SSHFORUM_BIND=0.0.0.0 SSHFORUM_PORT=2222
+ExecStart=/usr/bin/sshforum --bind ${SSHFORUM_BIND} --port ${SSHFORUM_PORT} --db /var/lib/sshforum/forum.db --host-key /var/lib/sshforum/ssh_host_ed25519_key --max-sessions 128
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+LimitCORE=0
+LimitNOFILE=1024
+TasksMax=16
+MemoryHigh=192M
+MemoryMax=256M
+CPUQuota=100%
+
+# StateDirectory= bind-mounts the persistent directory back through the empty
+# /var tree. SQLite must be able to create its WAL and shared-memory sidecars.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sshforum
+TemporaryFileSystem=/etc:ro /var:ro /run:ro
+BindReadOnlyPaths=/etc/ld.so.cache /etc/pki/tls/openssl.cnf -/etc/pki/tls/openssl.d /etc/crypto-policies
+ProtectHome=yes
+InaccessiblePaths=-/boot -/efi -/opt -/srv -/mnt -/media
+PrivateTmp=yes
+PrivateDevices=yes
+NoExecPaths=/
+ExecPaths=/usr/bin/sshforum /usr/lib /usr/lib64
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindAllow=ipv4:tcp:2222
+SocketBindAllow=ipv6:tcp:2222
+SocketBindDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @raw-io @reboot @swap @debug @obsolete @cpu-emulation connect
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target
