@@ -122,7 +122,7 @@ void test_crud_and_persistence() {
         require(thread.has_value(), "the created thread should be readable");
         require(thread->summary.id == thread_id, "thread ID should be preserved");
         require(thread->summary.title == "First topic", "thread title should be preserved");
-        require(thread->summary.body == "Opening post", "opening post should be preserved");
+        require(thread->body == "Opening post", "opening post should be preserved");
         require(!thread->summary.created_at.empty(), "thread timestamp should be populated");
         require(thread->summary.reply_count == 0, "a new thread should have no replies");
         require(thread->summary.last_reply_at.empty(), "a new thread should have no reply timestamp");
@@ -130,6 +130,11 @@ void test_crud_and_persistence() {
         const auto initial_summaries = store.list_threads();
         require(initial_summaries.size() == 1 && initial_summaries.front().last_reply_at.empty(),
                 "listing a thread without replies should have no reply timestamp");
+        require(initial_summaries.front().id == thread->summary.id &&
+                    initial_summaries.front().title == thread->summary.title &&
+                    initial_summaries.front().created_at == thread->summary.created_at &&
+                    initial_summaries.front().reply_count == thread->summary.reply_count,
+                "thread listing should agree with its detail summary");
 
         reply_id = store.reply(thread_id, "First reply");
         require(reply_id > 0, "created replies should have positive IDs");
@@ -151,7 +156,7 @@ void test_crud_and_persistence() {
         auto thread = reopened.get_thread(thread_id);
         require(thread.has_value(), "thread should survive reopening the database");
         require(thread->summary.title == "First topic", "reopened thread title should match");
-        require(thread->summary.body == "Opening post", "reopened opening post should match");
+        require(thread->body == "Opening post", "reopened opening post should match");
         require(thread->summary.reply_count == 1, "reopened reply count should match");
         require(thread->replies.size() == 1 && thread->replies.front().id == reply_id,
                 "reply should survive reopening the database");
@@ -206,7 +211,7 @@ void test_sql_metacharacters() {
     const auto second_id = store.create_thread("Still here", "Another post");
     auto first = store.get_thread(first_id);
     require(first.has_value(), "thread with SQL metacharacters should be readable");
-    require(first->summary.title == title && first->summary.body == body,
+    require(first->summary.title == title && first->body == body,
             "SQL metacharacters should be stored verbatim");
     require(first->replies.size() == 1 && first->replies.front().body == reply,
             "reply SQL metacharacters should be stored verbatim");
@@ -306,7 +311,7 @@ void test_legacy_migration_and_identity_secret() {
                 "legacy threads must remain anonymous");
         const auto old = store.get_thread(7);
         require(old && old->summary.title == "Old first" &&
-                    old->summary.body == "First body" && old->summary.reply_count == 1 &&
+                    old->body == "First body" && old->summary.reply_count == 1 &&
                     old->replies.size() == 1 && old->replies[0].id == 21 &&
                     old->replies[0].body == "Old reply" &&
                     old->replies[0].created_at == "2020-01-02T00:00:00.000Z" &&

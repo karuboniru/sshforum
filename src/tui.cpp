@@ -618,7 +618,7 @@ std::string Tui::render() {
             ? std::string("No replies yet") : thread_.replies.back().created_at), content_width);
         wrapped(content, display_author(thread_.summary.author_id), content_width);
         content.emplace_back();
-        wrapped(content, thread_.summary.body, content_width);
+        wrapped(content, thread_.body, content_width);
         for (const auto& reply : thread_.replies) {
             if (content.size() >= 100000) break;
             content.emplace_back(static_cast<std::size_t>(content_width), '-');

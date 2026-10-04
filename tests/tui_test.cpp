@@ -116,7 +116,9 @@ void test_post_reply_and_utf8() {
     const auto listed = store.list_threads();
     require(listed.size() == 1, "Ctrl+D should create a thread");
     require(listed.front().title == "题", "backspace should remove one UTF-8 character");
-    require(listed.front().body == "你好\nsecond line", "body should preserve UTF-8 and newline");
+    auto thread = store.get_thread(listed.front().id);
+    require(thread.has_value(), "created thread should be readable");
+    require(thread->body == "你好\nsecond line", "body should preserve UTF-8 and newline");
     require(posted.find("你好") != std::string::npos, "created thread should be visible");
     require(posted.find("Anonymous") != std::string::npos,
             "thread author should be anonymous");
@@ -124,7 +126,7 @@ void test_post_reply_and_utf8() {
     tui.input("a");
     tui.input("回帖");
     const auto replied = tui.input("\x04");
-    auto thread = store.get_thread(listed.front().id);
+    thread = store.get_thread(listed.front().id);
     require(thread && thread->replies.size() == 1, "Ctrl+D should create a reply");
     require(thread->replies.front().body == "回帖", "reply should preserve UTF-8");
     require(replied.find("回帖") != std::string::npos, "reply should be visible after submit");
@@ -229,8 +231,10 @@ void test_escape_keys_and_sanitization() {
             screen.find("\x1b[2J text") == std::string::npos,
             "user input must not execute ANSI sequences");
     auto latest = store.list_threads().front();
+    const auto detail = store.get_thread(latest.id);
+    require(detail.has_value(), "created thread should be readable");
     require(latest.title.find('\x1b') == std::string::npos &&
-            latest.body.find('\x1b') == std::string::npos,
+            detail->body.find('\x1b') == std::string::npos,
             "ANSI escape bytes must not be stored");
 
     tui.input("a");
@@ -279,7 +283,9 @@ void test_limits_and_paging() {
             "body overflow should show limit");
     tui.input("\x04");
     auto latest = store.list_threads().front();
-    require(latest.title.size() == 120 && latest.body.size() == 16384,
+    const auto detail = store.get_thread(latest.id);
+    require(detail.has_value(), "created thread should be readable");
+    require(latest.title.size() == 120 && detail->body.size() == 16384,
             "editor should enforce Store byte limits");
 }
 
@@ -381,7 +387,9 @@ void test_cursor_editing_and_reply() {
     const auto listed = store.list_threads();
     require(listed.size() == 1 && listed.front().title == "头甲丙尾",
             "middle insert, Delete, Backspace, Home and End should edit title by codepoint");
-    require(listed.front().body == "前甲a\n123X45\n乙b后",
+    auto thread = store.get_thread(listed.front().id);
+    require(thread.has_value(), "created thread should be readable");
+    require(thread->body == "前甲a\n123X45\n乙b后",
             "up arrow should follow display cells and Ctrl+Home/End should reach body edges");
 
     tui.input("a");
@@ -390,7 +398,7 @@ void test_cursor_editing_and_reply() {
     tui.input("中");
     tui.input("\x1b[3~");
     tui.input("\x04");
-    const auto thread = store.get_thread(listed.front().id);
+    thread = store.get_thread(listed.front().id);
     require(thread && thread->replies.size() == 1 &&
             thread->replies.front().body == "甲中\n尾",
             "reply editor should share Unicode cursor editing and Delete behavior");
@@ -429,7 +437,10 @@ void test_wrap_viewport_and_resize() {
     require(screen.find("\x1b[2;1H\x1b[?25h") != std::string::npos,
             "resize should keep the editor cursor visible");
     tui.input("\x04");
-    require(store.list_threads().front().body == "abcdefghijk",
+    const auto thread_id = store.list_threads().front().id;
+    const auto thread = store.get_thread(thread_id);
+    require(thread.has_value(), "created thread should be readable");
+    require(thread->body == "abcdefghijk",
             "navigation and viewport should not alter the draft");
 }
 
@@ -461,9 +472,11 @@ void test_middle_insertion_byte_limits() {
             "newline inserted in the middle must use one byte of body limit");
     tui.input("\x04");
     const auto latest = store.list_threads().front();
+    const auto detail = store.get_thread(latest.id);
+    require(detail.has_value(), "created thread should be readable");
     require(latest.title.size() == 120 && latest.title.front() == 'x',
             "title insertion at byte limit should preserve the cursor position");
-    require(latest.body.size() == 16384 && latest.body.starts_with("x\n"),
+    require(detail->body.size() == 16384 && detail->body.starts_with("x\n"),
             "body insertion at byte limit should preserve UTF-8 boundaries");
 }
 
@@ -512,7 +525,9 @@ void test_bounded_input_and_parser_state() {
     require(submitted.find("a中Xb") != std::string::npos,
             "bounded input should render the submitted draft");
     const auto latest = store.list_threads().front();
-    require(latest.title == "T" && latest.body == "a中Xb\nz",
+    const auto detail = store.get_thread(latest.id);
+    require(detail.has_value(), "created thread should be readable");
+    require(latest.title == "T" && detail->body == "a中Xb\nz",
             "bounded calls should preserve split UTF-8, Escape, and CRLF state");
 
     feed("a");

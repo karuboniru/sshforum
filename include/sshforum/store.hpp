@@ -11,7 +11,6 @@ namespace sshforum {
 struct ThreadSummary {
     std::int64_t id;
     std::string title;
-    std::string body;
     std::string created_at;
     std::int64_t reply_count;
     std::string author_id{};
@@ -28,6 +27,7 @@ struct Post {
 
 struct Thread {
     ThreadSummary summary;
+    std::string body;
     std::vector<Post> replies;
 };
 

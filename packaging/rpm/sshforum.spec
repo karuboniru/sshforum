@@ -1,6 +1,6 @@
 Name:           sshforum
 Version:        0.1.0
-Release:        5%{?dist}
+Release:        6%{?dist}
 Summary:        Anonymous SSH terminal forum
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
@@ -55,6 +55,9 @@ ctest --test-dir %{_vpath_builddir} --output-on-failure
 %{_unitdir}/sshforum.service
 
 %changelog
+* Sun Oct 04 2026 sshforum contributors - 0.1.0-6
+- Fetch thread bodies only for detail views, keeping list summaries lightweight
+
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-5
 - Set the listening socket nonblocking and bound coroutine input processing
 - Preserve buffered input and parser state across cooperative scheduling slices
