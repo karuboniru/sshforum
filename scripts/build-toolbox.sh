@@ -5,7 +5,7 @@ container="${TOOLBOX_CONTAINER:-fedora-toolbox-45}"
 
 if [[ "${1:-}" == "--install" ]]; then
     toolbox run -c "$container" sudo dnf install -y \
-        gcc-c++ cmake ninja-build pkgconf-pkg-config libssh-devel sqlite-devel python3-paramiko
+        gcc-c++ cmake ninja-build pkgconf-pkg-config libssh-devel sqlite-devel openssl-devel python3-paramiko
 elif [[ $# -gt 0 ]]; then
     echo "Usage: $0 [--install] (TOOLBOX_CONTAINER selects the container)" >&2
     exit 2

@@ -1,4 +1,5 @@
 #include "sshforum/server.hpp"
+#include "sshforum/identity.hpp"
 #include "sshforum/store.hpp"
 #include "sshforum/task.hpp"
 #include "sshforum/tui.hpp"
@@ -7,6 +8,9 @@
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -52,10 +56,32 @@ void ensure_host_key(const std::string& path) {
         throw std::runtime_error("cannot save host key: " + path);
 }
 
+std::string peer_address(ssh_session session) {
+    sockaddr_storage address{};
+    socklen_t size = sizeof(address);
+    if (getpeername(ssh_get_fd(session), reinterpret_cast<sockaddr*>(&address), &size) != 0)
+        throw std::runtime_error("cannot read peer address");
+    char buffer[INET6_ADDRSTRLEN]{};
+    const void* bytes = nullptr;
+    int family = address.ss_family;
+    if (family == AF_INET) {
+        bytes = &reinterpret_cast<const sockaddr_in*>(&address)->sin_addr;
+    } else if (family == AF_INET6) {
+        const auto& ip = reinterpret_cast<const sockaddr_in6*>(&address)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(&ip)) {
+            family = AF_INET;
+            bytes = &ip.s6_addr[12];
+        } else bytes = &ip;
+    } else throw std::runtime_error("unsupported peer address family");
+    if (!inet_ntop(family, bytes, buffer, sizeof(buffer)))
+        throw std::runtime_error("cannot format peer address");
+    return buffer;
+}
+
 class Connection {
 public:
-    explicit Connection(Store& store)
-        : session_(ssh_new(), ssh_free), event_(ssh_event_new(), ssh_event_free), tui_(store) {
+    explicit Connection(Store& store, const std::string& identity_secret)
+        : session_(ssh_new(), ssh_free), event_(ssh_event_new(), ssh_event_free), tui_(store), identity_secret_(identity_secret) {
         if (!session_ || !event_) throw std::runtime_error("cannot allocate SSH session");
     }
     ~Connection() {
@@ -69,19 +95,25 @@ public:
     }
     ssh_session session() const { return session_.get(); }
     void start() {
+        peer_ip_ = peer_address(session());
         ssh_set_blocking(session(), 0);
         ssh_callbacks_init(&server_callbacks_);
         server_callbacks_.userdata = this;
-        server_callbacks_.auth_none_function = [](ssh_session, const char*, void* data) {
-            return authenticate(data);
+        server_callbacks_.auth_none_function = [](ssh_session, const char* user, void* data) {
+            return authenticate(data, user, "none", "");
         };
-        server_callbacks_.auth_password_function = [](ssh_session, const char*, const char*, void* data) {
-            return authenticate(data);
+        server_callbacks_.auth_password_function = [](ssh_session, const char* user, const char* password, void* data) {
+            return authenticate(data, user, "password", password ? password : "");
         };
-        server_callbacks_.auth_pubkey_function = [](ssh_session, const char*, ssh_key, char state, void* data) -> int {
-            // Every key is allowed. An unsigned key probe is not a completed login.
-            if (state == SSH_PUBLICKEY_STATE_VALID) authenticate(data);
-            return SSH_AUTH_SUCCESS;
+        server_callbacks_.auth_pubkey_function = [](ssh_session, const char* user, ssh_key key, char state, void* data) -> int {
+            // Every valid key is allowed; a probe does not establish an identity.
+            if (state == SSH_PUBLICKEY_STATE_NONE) return SSH_AUTH_SUCCESS;
+            if (state != SSH_PUBLICKEY_STATE_VALID) return SSH_AUTH_DENIED;
+            char* encoded = nullptr;
+            if (ssh_pki_export_pubkey_base64(key, &encoded) != SSH_OK) return SSH_AUTH_DENIED;
+            const int result = authenticate(data, user, "publickey", encoded ? encoded : "");
+            ssh_string_free_char(encoded);
+            return result;
         };
         server_callbacks_.channel_open_request_session_function = [](ssh_session session, void* data) {
             auto& self = *static_cast<Connection*>(data);
@@ -120,7 +152,10 @@ public:
         // without consulting usernames, secrets, or system accounts.
         ssh_set_message_callback(session(), [](ssh_session, ssh_message message, void* data) {
             if (ssh_message_type(message) == SSH_REQUEST_AUTH) {
-                authenticate(data);
+                const auto method = ssh_message_subtype(message);
+                if (method != SSH_AUTH_METHOD_INTERACTIVE) return 1;
+                if (authenticate(data, ssh_message_auth_user(message), "keyboard-interactive", "") != SSH_AUTH_SUCCESS)
+                    return 1;
                 ssh_message_auth_reply_success(message, 0);
                 return 0;
             }
@@ -145,9 +180,19 @@ public:
         return {ssh_get_fd(session()), events, 0};
     }
 private:
-    static int authenticate(void* data) {
-        static_cast<Connection*>(data)->authenticated_ = true;
-        return SSH_AUTH_SUCCESS;
+    static int authenticate(void* data, const char* username,
+                            std::string_view method, std::string_view credential) noexcept {
+        auto& self = *static_cast<Connection*>(data);
+        if (self.authenticated_) return SSH_AUTH_SUCCESS;
+        try {
+            self.tui_.set_author_id(make_author_id(self.identity_secret_, self.peer_ip_,
+                                                 username ? username : "", method, credential));
+            self.authenticated_ = true;
+            return SSH_AUTH_SUCCESS;
+        } catch (...) {
+            // Never let an exception cross libssh's C callback boundary.
+            return SSH_AUTH_DENIED;
+        }
     }
     bool pump() {
         return ssh_event_dopoll(event_.get(), 0) != SSH_ERROR && ssh_is_connected(session());
@@ -245,6 +290,8 @@ private:
     bool authenticated_ = false, shell_ = false, resized_ = false, registered_ = false;
     int width_ = 80, height_ = 24;
     Tui tui_;
+    const std::string& identity_secret_;
+    std::string peer_ip_;
     std::string pending_;
     Clock::time_point last_write_{};
     Task task_;
@@ -260,6 +307,7 @@ int run_server(const ServerOptions& options) {
     std::signal(SIGPIPE, SIG_IGN);
     ensure_parent(options.database);
     Store store(options.database);
+    const auto identity_secret = store.get_or_create_identity_secret(generate_identity_secret());
     ensure_host_key(options.host_key);
     Handle<ssh_bind, ssh_bind_free> listener(ssh_bind_new(), ssh_bind_free);
     if (!listener) throw std::runtime_error("cannot allocate SSH listener");
@@ -289,7 +337,7 @@ int run_server(const ServerOptions& options) {
         if (ready < 0 && errno != EINTR) throw std::runtime_error("poll failed");
         if (stopping) break;
         if (ready > 0 && (descriptors.front().revents & POLLIN)) {
-            auto connection = std::make_unique<Connection>(store);
+            auto connection = std::make_unique<Connection>(store, identity_secret);
             if (ssh_bind_accept(listener.get(), connection->session()) == SSH_OK &&
                 connections.size() < static_cast<std::size_t>(options.max_sessions)) {
                 connection->start();

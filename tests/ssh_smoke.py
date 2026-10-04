@@ -7,9 +7,11 @@ Requires Paramiko (available in the project's Fedora toolbox).
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import os
 from pathlib import Path
+import re
 import socket
 import sqlite3
 import subprocess
@@ -84,23 +86,35 @@ class Server:
             self.log = None
 
 
-def authenticated_transport(port: int, method: str, key=None) -> paramiko.Transport:
-    transport = paramiko.Transport((HOST, port))
+def authenticated_transport(
+    port: int,
+    method: str,
+    key=None,
+    username: str | None = None,
+    password: str = "any-password",
+    source_ip: str | None = None,
+) -> paramiko.Transport:
+    connection = (HOST, port)
+    if source_ip is not None:
+        connection = socket.create_connection(
+            connection, timeout=TIMEOUT, source_address=(source_ip, 0)
+        )
+    transport = paramiko.Transport(connection)
     transport.banner_timeout = TIMEOUT
     transport.auth_timeout = TIMEOUT
     try:
         transport.start_client(timeout=TIMEOUT)
-        username = f"anonymous_{method}"
+        username = username if username is not None else f"anonymous_{method}"
         if method == "none":
             transport.auth_none(username)
         elif method == "password":
-            transport.auth_password(username, "any-password")
+            transport.auth_password(username, password)
         elif method == "publickey":
             transport.auth_publickey(username, key)
         elif method == "interactive":
             transport.auth_interactive(
                 username,
-                lambda _title, _instructions, prompts: ["anything" for _ in prompts],
+                lambda _title, _instructions, _prompts: [],
             )
         else:
             raise ValueError(method)
@@ -112,8 +126,20 @@ def authenticated_transport(port: int, method: str, key=None) -> paramiko.Transp
 
 
 class Terminal:
-    def __init__(self, port: int, method: str, key=None, width: int = 100, height: int = 24):
-        self.transport = authenticated_transport(port, method, key)
+    def __init__(
+        self,
+        port: int,
+        method: str,
+        key=None,
+        width: int = 100,
+        height: int = 24,
+        username: str | None = None,
+        password: str = "any-password",
+        source_ip: str | None = None,
+    ):
+        self.transport = authenticated_transport(
+            port, method, key, username, password, source_ip
+        )
         self.channel = None
         self.output = bytearray()
         try:
@@ -328,6 +354,146 @@ def check_editor(port: int, marker: str, database: Path) -> None:
         assert replies == [("回帖",)], f"reply editing saved unexpected text: {replies!r}"
 
 
+def check_identity(server: Server, marker: str, database: Path, key) -> None:
+    username = f"smoke_identity_user_{marker}"
+    other_username = f"smoke_identity_other_{marker}"
+    password = f"smoke_identity_password_{marker}_one"
+    other_password = f"smoke_identity_password_{marker}_two"
+    key2 = paramiko.RSAKey.generate(2048)
+    number = 0
+
+    def title() -> str:
+        nonlocal number
+        number += 1
+        return f"SMOKE_ID_{marker}_{number:02d}"
+
+    def label(author_id: str) -> str:
+        assert re.fullmatch(r"v1:[0-9a-f]{64}", author_id), (
+            f"invalid persisted author ID: {author_id!r}"
+        )
+        digest = bytes.fromhex(author_id[3:])
+        return "Anonymous#" + base64.b32encode(digest[:5]).decode("ascii")
+
+    def thread_author(terminal: Terminal, thread_title: str) -> tuple[int, str]:
+        mark = terminal.mark()
+        submit_post(terminal, thread_title, f"identity body {number}")
+        terminal.wait_for("SSH Forum | Thread #", mark)
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT id, author_id FROM threads WHERE title = ?", (thread_title,)
+            ).fetchone()
+        assert row is not None, f"identity thread {thread_title!r} was not persisted"
+        thread_id, author_id = row
+        short = label(author_id)
+        terminal.wait_for(short, mark)
+        terminal.wait_for(f"You: {short}", 0)
+        return thread_id, author_id
+
+    def new_thread(method: str, thread_title: str, **credentials) -> str:
+        with contextlib.closing(Terminal(server.port, method, **credentials)) as terminal:
+            return thread_author(terminal, thread_title)[1]
+
+    def identity_key() -> bytes:
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT value FROM forum_metadata WHERE key = 'identity_hmac_key_v1'"
+            ).fetchone()
+        assert row is not None, "identity HMAC key is missing"
+        secret = row[0]
+        assert isinstance(secret, bytes) and len(secret) == 32, (
+            "identity HMAC key must be a 32-byte SQLite BLOB"
+        )
+        return secret
+
+    first_title = title()
+    second_title = title()
+    with contextlib.closing(Terminal(server.port, "none", username=username)) as first:
+        with contextlib.closing(Terminal(server.port, "none", username=username)) as second:
+            first_peer = first.transport.sock.getsockname()
+            second_peer = second.transport.sock.getsockname()
+            assert first_peer[0] == second_peer[0] == HOST
+            assert first_peer[1] != second_peer[1], "test connections reused a source port"
+            _, none_author = thread_author(first, first_title)
+            second_id, none_reconnect = thread_author(second, second_title)
+    assert none_reconnect == none_author, "none identity changed with the source port"
+
+    with contextlib.closing(Terminal(
+        server.port, "password", username=username, password=password
+    )) as password_session:
+        password_session.send_and_expect("\r", second_title)
+        reply_body = f"SMOKE_ID_REPLY_{marker}"
+        mark = password_session.mark()
+        submit_reply(password_session, reply_body)
+        password_session.wait_for("Reply #", mark)
+        with sqlite3.connect(database) as connection:
+            replies = connection.execute(
+                "SELECT author_id FROM posts WHERE thread_id = ? AND body = ?",
+                (second_id, reply_body),
+            ).fetchall()
+        assert len(replies) == 1, "identity reply was not persisted exactly once"
+        reply_author = replies[0][0]
+        password_session.wait_for(label(reply_author), mark)
+        assert reply_author != none_author, "password and none identities share a domain"
+        password_session.send_and_expect("b", "SSH Forum | Threads")
+        password_author = thread_author(password_session, title())[1]
+    assert reply_author == password_author, "reply and thread used different session identities"
+
+    assert new_thread("none", title(), username=other_username) != none_author, (
+        "different SSH usernames share a none identity"
+    )
+    assert new_thread("password", title(), username=username, password=password) == (
+        password_author
+    ), "same password identity changed after reconnect"
+    assert new_thread("password", title(), username=username, password=other_password) != (
+        password_author
+    ), "different passwords share an identity"
+
+    publickey_author = new_thread("publickey", title(), username=username, key=key)
+    assert publickey_author != none_author, "publickey and none identities share a domain"
+    assert publickey_author != password_author, "publickey and password identities share a domain"
+    assert new_thread("publickey", title(), username=username, key=key) == (
+        publickey_author
+    ), "same public key identity changed after reconnect"
+    assert new_thread("publickey", title(), username=username, key=key2) != (
+        publickey_author
+    ), "different public keys share an identity"
+
+    interactive_author = new_thread("interactive", title(), username=username)
+    assert interactive_author != none_author, "interactive and none identities share a domain"
+    assert new_thread("interactive", title(), username=username) == (
+        interactive_author
+    ), "empty interactive identity changed after reconnect"
+
+    if sys.platform.startswith("linux"):
+        try:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.2", 0))
+        except OSError:
+            pass
+        else:
+            assert new_thread(
+                "none", title(), username=username, source_ip="127.0.0.2"
+            ) != none_author, "different source IPs share an identity"
+
+    secret_before_restart = identity_key()
+    server.stop()
+    server.start()
+    assert identity_key() == secret_before_restart, "identity HMAC key changed on restart"
+    assert new_thread("none", title(), username=username) == none_author, (
+        "none identity changed after restart"
+    )
+
+    with sqlite3.connect(database) as connection:
+        for table in ("threads", "posts"):
+            for row in connection.execute(f"SELECT * FROM {table}"):
+                values = " ".join(str(value) for value in row if value is not None)
+                for credential in (username, other_username, password, other_password,
+                                   HOST, "127.0.0.2"):
+                    assert credential not in values, (
+                        f"raw SSH credential {credential!r} leaked into {table}"
+                    )
+
+
 def run(binary: Path) -> None:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SystemExit(f"server binary is not executable: {binary}")
@@ -389,6 +555,7 @@ def run(binary: Path) -> None:
                 persisted.send_and_expect("r", reply_b)
             check_navigation(server.port, marker)
             check_editor(server.port, marker, directory / "forum.db")
+            check_identity(server, marker, directory / "forum.db", key)
             print("SSH smoke test passed")
         except BaseException:
             server.stop()

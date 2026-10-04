@@ -1,4 +1,5 @@
 #include "sshforum/tui.hpp"
+#include "sshforum/identity.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -189,6 +190,11 @@ std::size_t point_at(const EditorLayout& layout, std::size_t offset, bool wrap_e
 
 Tui::Tui(Store& store) : store_(store) {}
 
+void Tui::set_author_id(std::string author_id) {
+    author_id_ = std::move(author_id);
+    dirty_ = true;
+}
+
 void Tui::resize(int width, int height) {
     width_ = std::clamp(width, 1, 400);
     height_ = std::clamp(height, 1, 200);
@@ -270,13 +276,13 @@ void Tui::submit() {
     if (draft_body_.empty()) { status_ = "Body is empty"; dirty_ = true; return; }
     try {
         if (page_ == Page::new_body) {
-            const auto id = store_.create_thread(draft_title_, draft_body_);
+            const auto id = store_.create_thread(draft_title_, draft_body_, author_id_);
             draft_title_.clear();
             draft_body_.clear();
             show_thread(id);
             if (page_ == Page::thread) status_ = "Thread posted";
         } else if (page_ == Page::reply_body) {
-            store_.reply(thread_id_, draft_body_);
+            store_.reply(thread_id_, draft_body_, author_id_);
             draft_body_.clear();
             page_ = Page::thread;
             refresh_thread();
@@ -529,7 +535,8 @@ std::string Tui::render() {
     std::string footer;
     std::vector<std::string> content;
     if (page_ == Page::list) {
-        header = "SSH Forum | Threads (" + std::to_string(threads_.size()) + ")";
+        header = "SSH Forum | Threads (" + std::to_string(threads_.size()) +
+                 ") | You: " + display_author(author_id_);
         footer = "j/k: move  PgUp/PgDn: page  Enter: open  n: new  r: refresh  q: quit";
         if (threads_.empty()) content.emplace_back("No threads yet. Press n to post.");
         else {
@@ -550,13 +557,14 @@ std::string Tui::render() {
         wrapped(content, "Posted: " + thread_.summary.created_at, content_width);
         wrapped(content, "Last reply: " + (thread_.replies.empty()
             ? std::string("No replies yet") : thread_.replies.back().created_at), content_width);
-        content.emplace_back("Anonymous");
+        wrapped(content, display_author(thread_.summary.author_id), content_width);
         content.emplace_back();
         wrapped(content, thread_.summary.body, content_width);
         content.emplace_back();
         for (const auto& reply : thread_.replies) {
             if (content.size() >= 100000) break;
-            wrapped(content, "Anonymous  Reply #" + std::to_string(reply.id), content_width);
+            wrapped(content, display_author(reply.author_id) + "  Reply #" +
+                             std::to_string(reply.id), content_width);
             wrapped(content, "Posted: " + reply.created_at, content_width);
             wrapped(content, reply.body, content_width);
             content.emplace_back();

@@ -15,6 +15,7 @@ class Tui {
 public:
     explicit Tui(Store& store);
 
+    void set_author_id(std::string author_id);
     void resize(int width, int height);
     std::string start();
     std::string input(std::string_view bytes);
@@ -26,6 +27,7 @@ private:
     enum class Escape { none, esc, csi, ss3 };
 
     Store& store_;
+    std::string author_id_;
     Page page_ = Page::list;
     Escape escape_ = Escape::none;
     std::chrono::steady_clock::time_point escape_at_{};

@@ -1,5 +1,7 @@
 #include "sshforum/store.hpp"
 
+#include <sqlite3.h>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +22,49 @@ void require(bool condition, const std::string& message) {
         throw std::runtime_error(message);
     }
 }
+
+class RawDatabase {
+public:
+    explicit RawDatabase(const std::filesystem::path& path) {
+        if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) {
+            const std::string message = sqlite3_errmsg(db_);
+            sqlite3_close(db_);
+            throw std::runtime_error("open raw database: " + message);
+        }
+    }
+
+    ~RawDatabase() { sqlite3_close(db_); }
+
+    void execute(const char* sql) {
+        char* error = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &error) != SQLITE_OK) {
+            const std::string message = error != nullptr ? error : sqlite3_errmsg(db_);
+            sqlite3_free(error);
+            throw std::runtime_error("raw SQLite: " + message);
+        }
+    }
+
+    std::string scalar(const char* sql) {
+        sqlite3_stmt* statement = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(db_));
+        }
+        const int result = sqlite3_step(statement);
+        if (result != SQLITE_ROW) {
+            sqlite3_finalize(statement);
+            throw std::runtime_error("raw SQLite scalar query returned no row");
+        }
+        const auto* value = sqlite3_column_text(statement, 0);
+        const std::string answer = value != nullptr
+                                       ? reinterpret_cast<const char*>(value)
+                                       : "";
+        sqlite3_finalize(statement);
+        return answer;
+    }
+
+private:
+    sqlite3* db_ = nullptr;
+};
 
 template <typename Exception, typename Function>
 void require_throws(Function&& function, const std::string& message) {
@@ -181,6 +226,157 @@ void test_latest_reply_sorting_and_limit() {
             "list limit should return the first thread in sort order");
 }
 
+void test_legacy_migration_and_identity_secret() {
+    TemporaryDatabase database;
+    {
+        RawDatabase raw(database.path());
+        raw.execute("CREATE TABLE activity_clock ("
+                    "id INTEGER PRIMARY KEY CHECK (id = 1), sequence INTEGER NOT NULL)");
+        raw.execute("INSERT INTO activity_clock (id, sequence) VALUES (1, 30)");
+        raw.execute("CREATE TABLE threads ("
+                    "id INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL DEFAULT "
+                    "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), "
+                    "activity_sequence INTEGER NOT NULL UNIQUE, "
+                    "reply_count INTEGER NOT NULL DEFAULT 0)");
+        raw.execute("CREATE TABLE posts ("
+                    "id INTEGER PRIMARY KEY, "
+                    "thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
+                    "body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT "
+                    "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))");
+        raw.execute("CREATE INDEX posts_thread_id_id ON posts(thread_id, id)");
+        raw.execute("INSERT INTO threads "
+                    "(id, title, body, created_at, activity_sequence, reply_count) "
+                    "VALUES (7, 'Old first', 'First body', '2020-01-01T00:00:00.000Z', 10, 1), "
+                    "(9, 'Old second', 'Second body', '2020-02-01T00:00:00.000Z', 30, 0)");
+        raw.execute("INSERT INTO posts (id, thread_id, body, created_at) VALUES "
+                    "(21, 7, 'Old reply', '2020-01-02T00:00:00.000Z')");
+        require(raw.scalar("PRAGMA user_version") == "0", "fixture must be a v0 database");
+    }
+
+    const std::string author = "v1:" + std::string(64, 'a');
+    std::string first_candidate(32, 'A');
+    first_candidate[0] = '\0';
+    std::int64_t new_thread_id;
+    {
+        sshforum::Store store(database.path().string());
+        const auto summaries = store.list_threads();
+        require(summaries.size() == 2 && summaries[0].id == 9 && summaries[1].id == 7,
+                "migration must preserve activity order and thread IDs");
+        require(summaries[0].created_at == "2020-02-01T00:00:00.000Z" &&
+                    summaries[1].created_at == "2020-01-01T00:00:00.000Z",
+                "migration must preserve timestamps");
+        require(summaries[0].author_id.empty() && summaries[1].author_id.empty(),
+                "legacy threads must remain anonymous");
+        const auto old = store.get_thread(7);
+        require(old && old->summary.title == "Old first" &&
+                    old->summary.body == "First body" && old->summary.reply_count == 1 &&
+                    old->replies.size() == 1 && old->replies[0].id == 21 &&
+                    old->replies[0].body == "Old reply" &&
+                    old->replies[0].created_at == "2020-01-02T00:00:00.000Z" &&
+                    old->replies[0].author_id.empty(),
+                "migration must preserve legacy post data and anonymity");
+
+        require(store.get_or_create_identity_secret(first_candidate) == first_candidate,
+                "the first valid candidate must become the secret, including binary bytes");
+        require(store.get_or_create_identity_secret(std::string(32, 'B')) == first_candidate,
+                "later candidates must return the stored secret");
+        require_throws<std::invalid_argument>(
+            [&] { store.get_or_create_identity_secret(std::string(31, 'x')); },
+            "short secret candidates must be rejected");
+        require_throws<std::invalid_argument>(
+            [&] { store.get_or_create_identity_secret(std::string(33, 'x')); },
+            "long secret candidates must be rejected");
+
+        new_thread_id = store.create_thread("Named", "New body", author);
+        const auto reply_id = store.reply(7, "Named reply", author);
+        require(store.get_thread(new_thread_id)->summary.author_id == author,
+                "new thread author ID must persist");
+        const auto updated = store.get_thread(7);
+        require(updated->replies.size() == 2 && updated->replies[1].id == reply_id &&
+                    updated->replies[1].author_id == author,
+                "new reply author ID must persist");
+        require(store.list_threads()[0].id == 7,
+                "a migrated thread must still rise on reply");
+
+        require_throws<std::invalid_argument>(
+            [&] { store.create_thread("Bad", "Body", "v1:" + std::string(63, 'a')); },
+            "short author hashes must be rejected");
+        require_throws<std::invalid_argument>(
+            [&] { store.create_thread("Bad", "Body", "v1:" + std::string(64, 'A')); },
+            "uppercase author hashes must be rejected");
+        require_throws<std::invalid_argument>(
+            [&] { store.reply(7, "Bad", "v2:" + std::string(64, 'a')); },
+            "unknown author hash versions must be rejected");
+    }
+    {
+        RawDatabase raw(database.path());
+        require(raw.scalar("PRAGMA user_version") == "1", "migration must set v1");
+        require(raw.scalar("SELECT sequence FROM activity_clock WHERE id = 1") == "32",
+                "migration must retain the activity clock");
+        require(raw.scalar("SELECT typeof(value) FROM forum_metadata "
+                           "WHERE key = 'identity_hmac_key_v1'") == "blob",
+                "the secret must be stored as a BLOB");
+        raw.execute("INSERT INTO threads "
+                    "(id, title, body, activity_sequence) "
+                    "VALUES (15, 'Old SQL', 'Compatible', 33)");
+        raw.execute("INSERT INTO posts (id, thread_id, body) "
+                    "VALUES (100, 15, 'Old SQL reply')");
+        require(raw.scalar("SELECT author_id FROM threads WHERE id = 15").empty() &&
+                    raw.scalar("SELECT author_id FROM posts WHERE id = 100").empty(),
+                "old explicit-column inserts must receive anonymous defaults");
+    }
+    {
+        sshforum::Store reopened(database.path().string());
+        require(reopened.get_or_create_identity_secret(std::string(32, 'C')) == first_candidate,
+                "reopening must retain the original secret");
+        require(reopened.get_thread(new_thread_id)->summary.author_id == author,
+                "reopening must retain author IDs");
+        const auto old_sql_thread = reopened.get_thread(15);
+        require(old_sql_thread && old_sql_thread->summary.author_id.empty() &&
+                    old_sql_thread->replies.size() == 1 &&
+                    old_sql_thread->replies[0].author_id.empty(),
+                "old SQL inserts must be readable as anonymous");
+    }
+    {
+        RawDatabase raw(database.path());
+        raw.execute("UPDATE forum_metadata SET value = x'00' "
+                    "WHERE key = 'identity_hmac_key_v1'");
+    }
+    {
+        sshforum::Store reopened(database.path().string());
+        require_throws<std::runtime_error>(
+            [&] { reopened.get_or_create_identity_secret(first_candidate); },
+            "a malformed stored secret must fail without replacement");
+    }
+    {
+        RawDatabase raw(database.path());
+        require(raw.scalar("SELECT length(value) FROM forum_metadata "
+                           "WHERE key = 'identity_hmac_key_v1'") == "1",
+                "a malformed stored secret must not be reset");
+    }
+}
+
+void test_future_version_is_untouched() {
+    TemporaryDatabase database;
+    {
+        RawDatabase raw(database.path());
+        raw.execute("PRAGMA user_version = 2");
+    }
+    require_throws<std::runtime_error>(
+        [&] { sshforum::Store store(database.path().string()); },
+        "a future database version must be rejected");
+    {
+        RawDatabase raw(database.path());
+        require(raw.scalar("PRAGMA user_version") == "2",
+                "a future version must remain unchanged");
+        require(raw.scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'") == "0",
+                "future databases must not gain tables");
+        require(raw.scalar("PRAGMA journal_mode") == "delete",
+                "future databases must not be switched to WAL");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -189,6 +385,8 @@ int main() {
         test_validation_and_missing_thread();
         test_sql_metacharacters();
         test_latest_reply_sorting_and_limit();
+        test_legacy_migration_and_identity_secret();
+        test_future_version_is_untouched();
         std::cout << "store tests passed\n";
         return 0;
     } catch (const std::exception& error) {

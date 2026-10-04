@@ -1,10 +1,10 @@
 # sshforum
 
-基于 **C++20、libssh 和 SQLite** 的 SSH 匿名论坛服务器。连接后直接进入全屏 TUI，帖子采用「主帖 + 平铺回复」结构，所有人显示为 Anonymous，没有注册、账户或权限分级。
+基于 **C++20、libssh 和 SQLite** 的 SSH 匿名论坛服务器。连接后直接进入全屏 TUI，帖子采用「主帖 + 平铺回复」结构，新帖子显示稳定匿名标识，例如 `Anonymous#ABCDEFGH`，没有注册、账户或权限分级。
 
 ## 构建与启动
 
-Linux 环境，需要 C++20 编译器、CMake ≥ 3.20、libssh ≥ 0.10、SQLite3。项目提供 toolbox 构建脚本；Python/Paramiko 只用于 SSH 集成测试。
+Linux 环境，需要 C++20 编译器、CMake ≥ 3.20、libssh ≥ 0.10、SQLite3、OpenSSL ≥ 3.0。项目提供 toolbox 构建脚本；Python/Paramiko 只用于 SSH 集成测试。
 
 ```bash
 # 如果还没有 toolbox 容器，先创建一个
@@ -39,6 +39,14 @@ ssh -tt -p 2222 anonymous@localhost
 ```
 
 如果宿主机没有兼容的运行库，以上命令也应通过 `toolbox run -c fedora-toolbox-45` 执行。远程连接使用服务器地址，监听端口需能从客户端访问。
+
+## 稳定匿名标识
+
+`none` 认证使用「对端 IP + SSH 用户名」；直接使用 password / publickey 认证时还加入认证方式和收到的密码 / 公钥。keyboard-interactive 不询问答案，使用 IP、用户名和认证方式。普通 OpenSSH 客户端通常先尝试 `none`，成功后不会再发送密码或公钥，因此更改 `PreferredAuthentications` 不保证改变标识来源。
+
+服务器用持久化的随机密钥计算 HMAC-SHA256，保存完整摘要，显示前 40 位对应的 8 个 Base32 字符。相同输入在重连、源端口变化和服务重启后保持一致；IP、用户名或认证材料变化会产生不同标识。共享出口 IP 且用户名相同的 `none` 用户会得到相同标识；短显示名也可能碰撞。它只是匿名标签，不是账号、权限或身份认证保证。
+
+首次升级会在事务中自动将 SQLite schema 从 v0 迁移到 v1：为主帖和回复增加作者字段，并保存身份密钥。历史帖子仍显示 `Anonymous`，不推断作者。旧版本显式列插入仍兼容；遇到高于 v1 的数据库会拒绝启动，避免误改。密钥存储在数据库的 `forum_metadata` 中，完整备份数据库即可保留标识；异常密钥会报错而不会自动替换。
 
 ## 操作
 
@@ -77,6 +85,7 @@ src/server.cpp        libssh 回调、非阻塞连接、poll 调度器
 include/sshforum/task.hpp  C++20 coroutine Task / RAII
 src/tui.cpp           TUI 状态机、增量键盘解析、终端渲染
 src/store.cpp         SQLite 持久化、事务、参数绑定
+src/identity.cpp      HMAC 作者 ID 与短显示名
 tests/                存储、TUI、真实 SSH 端到端测试
 ```
 
@@ -84,7 +93,7 @@ tests/                存储、TUI、真实 SSH 端到端测试
 
 SQLite 使用 WAL、外键、prepared statements 和事务。数据库访问保持同步，适合小型服务；写事务和较大的帖子渲染可能短暂阻塞事件循环。认证/进入界面超时为 30 秒，空闲连接超时 30 分钟，慢客户端输出有缓冲上限；这些是资源边界，不是账户权限。
 
-服务仅实现论坛终端，不提供 exec 命令执行、SFTP、端口转发。帖子内容输出前过滤控制字符，防止终端转义注入。数据仅保存帖子和回复，不保存登录名或密码。当前版本没有附件、搜索、删除、管理面板或自动推送；正文很长时需滚动阅读。
+服务仅实现论坛终端，不提供 exec 命令执行、SFTP、端口转发。帖子内容输出前过滤控制字符，防止终端转义注入。数据库保存帖子、回复、完整匿名作者 ID 和服务器身份密钥，不保存原始 IP、登录名、密码或公钥。当前版本没有附件、搜索、删除、管理面板或自动推送；正文很长时需滚动阅读。
 
 ## 数据与测试
 
@@ -96,6 +105,6 @@ SQLite 使用 WAL、外键、prepared statements 和事务。数据库访问保�
 toolbox run -c fedora-toolbox-45 ctest --test-dir build --output-on-failure
 ```
 
-`store` 验证持久化、排序、输入边界、并发和事务；`tui` 验证导航、编辑、UTF-8 与控制字符处理；`ssh_smoke` 启动临时服务器，通过 Paramiko 验证开放认证、双客户端操作、窗口调整、终端恢复和重启持久化。测试使用独立临时数据，不污染实际论坛。
+`identity` 验证 HMAC 向量、字段编码和显示名；`store` 验证 schema 迁移、身份密钥与持久化、排序、输入边界、并发和事务；`tui` 验证导航、编辑、UTF-8 与控制字符处理；`ssh_smoke` 启动临时服务器，通过 Paramiko 验证开放认证、双客户端操作、窗口调整、终端恢复和重启持久化。测试使用独立临时数据，不污染实际论坛。
 
 libssh API 参考：[官方服务端文档](https://api.libssh.org/stable/group__libssh__server.html)。

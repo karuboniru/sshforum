@@ -17,6 +17,13 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::size_t count_occurrences(const std::string& text, const std::string& needle) {
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + needle.size())) ++count;
+    return count;
+}
+
 class TemporaryDatabase {
 public:
     TemporaryDatabase() {
@@ -86,6 +93,67 @@ void test_post_reply_and_utf8() {
     require(tui.input("q") == sshforum::Tui::restore_terminal(),
             "quit should restore terminal");
     require(tui.done(), "quit should mark TUI done");
+}
+
+void test_stable_author_identity() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    const std::string self_id = "v1:" + std::string(64, '0');
+    const std::string other_id = "v1:" + std::string(64, 'f');
+    const auto historical_id = store.create_thread("historical", "old body");
+    const auto other_thread_id = store.create_thread("other", "other body", other_id);
+    store.reply(other_thread_id, "other reply", other_id);
+
+    sshforum::Tui tui(store);
+    tui.set_author_id(self_id);
+    tui.resize(100, 12);
+    const auto listing = tui.start();
+    require(listing.find("You: Anonymous#AAAAAAAA") != std::string::npos,
+            "thread list should identify the current anonymous author");
+    require(listing.find(self_id) == std::string::npos,
+            "thread list must not show the raw author ID");
+
+    const auto other_screen = tui.input("\r");
+    require(count_occurrences(other_screen, "Anonymous#77777777") == 2 &&
+            other_screen.find("other reply") != std::string::npos,
+            "thread and reply should show their stored author's identity");
+    require(other_screen.find("Anonymous#AAAAAAAA") == std::string::npos,
+            "another author's posts must not use the current session identity");
+    require(other_screen.find(other_id) == std::string::npos,
+            "thread screen must not show a raw author ID");
+
+    tui.input("b");
+    tui.input("j");
+    const auto historical_screen = tui.input("\r");
+    require(historical_screen.find("historical") != std::string::npos &&
+            historical_screen.find("Anonymous") != std::string::npos &&
+            historical_screen.find("Anonymous#") == std::string::npos,
+            "posts with empty legacy author IDs should remain Anonymous");
+    require(store.get_thread(historical_id)->summary.author_id.empty(),
+            "historical post should retain its empty author ID");
+
+    tui.input("b");
+    tui.input("n");
+    tui.input("mine\rmy body");
+    const auto posted = tui.input("\x04");
+    const auto latest = store.list_threads().front();
+    require(latest.title == "mine" && latest.author_id == self_id,
+            "new threads should persist the current session author ID");
+    require(posted.find("Anonymous#AAAAAAAA") != std::string::npos &&
+            posted.find(self_id) == std::string::npos,
+            "new thread should show only the derived anonymous label");
+
+    tui.input("a");
+    tui.input("my reply");
+    const auto replied = tui.input("\x04");
+    const auto thread = store.get_thread(latest.id);
+    require(thread && thread->replies.size() == 1 &&
+            thread->replies.front().author_id == self_id,
+            "new replies should persist the current session author ID");
+    require(count_occurrences(replied, "Anonymous#AAAAAAAA") == 2 &&
+            replied.find("my reply") != std::string::npos &&
+            replied.find(self_id) == std::string::npos,
+            "new reply should show only the derived anonymous label");
 }
 
 void test_escape_keys_and_sanitization() {
@@ -277,6 +345,7 @@ void test_middle_insertion_byte_limits() {
 
 int main() {
     test_post_reply_and_utf8();
+    test_stable_author_identity();
     test_escape_keys_and_sanitization();
     test_limits_and_paging();
     test_cursor_editing_and_reply();

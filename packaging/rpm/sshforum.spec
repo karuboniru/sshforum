@@ -1,6 +1,6 @@
 Name:           sshforum
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Anonymous SSH terminal forum
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
@@ -10,6 +10,7 @@ BuildRequires:  cmake-rpm-macros
 BuildRequires:  gcc-c++
 BuildRequires:  ninja-build
 BuildRequires:  pkgconfig(libssh) >= 0.10
+BuildRequires:  pkgconfig(libcrypto) >= 3.0
 BuildRequires:  pkgconfig(sqlite3)
 BuildRequires:  python3-paramiko
 BuildRequires:  systemd-rpm-macros
@@ -54,6 +55,9 @@ ctest --test-dir %{_vpath_builddir} --output-on-failure
 %{_unitdir}/sshforum.service
 
 %changelog
+* Sun Oct 04 2026 sshforum contributors - 0.1.0-3
+- Add persistent pseudonymous author identities and automatic SQLite migration
+
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-2
 - Remove fragile configuration-file bind mounts under SELinux
 - Add UTF-8 cursor movement, insertion and deletion to post editors

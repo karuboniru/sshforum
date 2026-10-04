@@ -14,6 +14,7 @@ struct ThreadSummary {
     std::string body;
     std::string created_at;
     std::int64_t reply_count;
+    std::string author_id{};
 };
 
 struct Post {
@@ -21,6 +22,7 @@ struct Post {
     std::int64_t thread_id;
     std::string body;
     std::string created_at;
+    std::string author_id{};
 };
 
 struct Thread {
@@ -40,8 +42,11 @@ public:
 
     std::vector<ThreadSummary> list_threads(int limit = 200);
     std::optional<Thread> get_thread(std::int64_t id);
-    std::int64_t create_thread(const std::string& title, const std::string& body);
-    std::int64_t reply(std::int64_t thread_id, const std::string& body);
+    std::int64_t create_thread(const std::string& title, const std::string& body,
+                               const std::string& author_id = "");
+    std::int64_t reply(std::int64_t thread_id, const std::string& body,
+                       const std::string& author_id = "");
+    std::string get_or_create_identity_secret(const std::string& candidate);
 
 private:
     struct Impl;

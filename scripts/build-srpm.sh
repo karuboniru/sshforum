@@ -40,6 +40,9 @@ sources=(
     scripts/build-srpm.sh
     scripts/build-toolbox.sh
     scripts/test-systemd.sh
+    include/sshforum/identity.hpp
+    src/identity.cpp
+    tests/identity_test.cpp
     src/main.cpp
     src/server.cpp
     src/store.cpp
