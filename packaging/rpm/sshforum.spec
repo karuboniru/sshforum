@@ -1,6 +1,6 @@
 Name:           sshforum
 Version:        0.1.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Anonymous SSH terminal forum
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
@@ -55,6 +55,10 @@ ctest --test-dir %{_vpath_builddir} --output-on-failure
 %{_unitdir}/sshforum.service
 
 %changelog
+* Sun Oct 04 2026 sshforum contributors - 0.1.0-4
+- Show right-aligned relative thread timestamps and separate entries and messages
+- Add right/left arrow navigation between the thread list and thread view
+
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-3
 - Add persistent pseudonymous author identities and automatic SQLite migration
 

@@ -20,7 +20,7 @@ bash scripts/build-srpm.sh
 ```text
 dist/rpmbuild/SOURCES/sshforum-0.1.0.tar.gz
 dist/rpmbuild/SPECS/sshforum.spec
-dist/rpmbuild/SRPMS/sshforum-0.1.0-3.*.src.rpm
+dist/rpmbuild/SRPMS/sshforum-0.1.0-4.*.src.rpm
 ```
 
 源码归档使用显式文件清单，包含代码、测试、安装文档、unit、spec 和构建脚本；不包含 `data/`、数据库、主机密钥、构建目录或 Git 元数据。脚本检查 CMake/spec 版本一致，归档文件时间由 `SOURCE_DATE_EPOCH` 控制，默认归零；这不承诺整个 SRPM/RPM 二进制完全可复现。
@@ -30,7 +30,7 @@ dist/rpmbuild/SRPMS/sshforum-0.1.0-3.*.src.rpm
 ```bash
 toolbox run -c fedora-toolbox-45 rpmbuild --rebuild \
   --define "_topdir $PWD/dist/rpmbuild" \
-  dist/rpmbuild/SRPMS/sshforum-0.1.0-3.*.src.rpm
+  dist/rpmbuild/SRPMS/sshforum-0.1.0-4.*.src.rpm
 ```
 
 `%check` 会运行 SQLite、TUI 和真实 SSH 测试；测试使用临时目录和随机高端口。输出在 `dist/rpmbuild/RPMS/`。目标系统版本不同，应使用匹配目标 Fedora 版本的 toolbox 和 `TOOLBOX_CONTAINER=容器名` 构建，不应直接安装为更新 glibc/libssh 构建的包。
@@ -40,7 +40,7 @@ toolbox run -c fedora-toolbox-45 rpmbuild --rebuild \
 普通 Fedora 宿主机上安装主包（不必安装 debuginfo/debugsource）：
 
 ```bash
-sudo dnf install ./dist/rpmbuild/RPMS/$(uname -m)/sshforum-0.1.0-3.*.$(uname -m).rpm
+sudo dnf install ./dist/rpmbuild/RPMS/$(uname -m)/sshforum-0.1.0-4.*.$(uname -m).rpm
 sudo systemctl enable --now sshforum.service
 systemctl status sshforum.service
 sudo journalctl -u sshforum.service -f

@@ -416,7 +416,7 @@ void Tui::key(std::string_view name) {
         } else if (name == "down" || name == "j") {
             selected_ = std::min(std::max(0, static_cast<int>(threads_.size()) - 1), selected_ + 1);
             dirty_ = true;
-        } else if (name == "enter") {
+        } else if (name == "enter" || name == "right") {
             if (!threads_.empty()) show_thread(threads_[selected_].id);
         } else if (name == "n") {
             page_ = Page::new_title; draft_title_.clear(); draft_body_.clear();
@@ -435,7 +435,7 @@ void Tui::key(std::string_view name) {
         else if (name == "down" || name == "j") { thread_scroll_ = std::min(100000, thread_scroll_ + 1); dirty_ = true; }
         else if (name == "page-up") { thread_scroll_ = std::max(0, thread_scroll_ - std::max(1, height_ - 2)); dirty_ = true; }
         else if (name == "page-down") { thread_scroll_ = std::min(100000, thread_scroll_ + std::max(1, height_ - 2)); dirty_ = true; }
-        else if (name == "b") { page_ = Page::list; refresh_list(); }
+        else if (name == "b" || name == "left") { page_ = Page::list; refresh_list(); }
         else if (name == "r") refresh_thread();
         else if (name == "a") {
             page_ = Page::reply_body; draft_body_.clear(); status_.clear();
@@ -571,7 +571,7 @@ std::string Tui::render() {
     if (page_ == Page::list) {
         header = "SSH Forum | Threads (" + std::to_string(threads_.size()) +
                  ") | You: " + display_author(author_id_);
-        footer = "j/k: move  PgUp/PgDn: page  Enter: open  n: new  r: refresh  q: quit";
+        footer = "j/k: move  PgUp/PgDn: page  Enter/Right: open  n: new  r: refresh  q: quit";
         if (threads_.empty()) content.emplace_back("No threads yet. Press n to post.");
         else {
             const int visible_threads = std::max(1, (content_height + 1) / 3);
@@ -592,7 +592,7 @@ std::string Tui::render() {
         }
     } else if (page_ == Page::thread) {
         header = "SSH Forum | Thread #" + std::to_string(thread_id_);
-        footer = "j/k: scroll  PgUp/PgDn: page  a: reply  r: refresh  b: back";
+        footer = "j/k: scroll  PgUp/PgDn: page  a: reply  r: refresh  b/Left: back";
         wrapped(content, thread_.summary.title, content_width);
         wrapped(content, "Posted: " + thread_.summary.created_at, content_width);
         wrapped(content, "Last reply: " + (thread_.replies.empty()
