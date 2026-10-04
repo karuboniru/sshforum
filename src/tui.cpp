@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -113,11 +114,75 @@ void wrapped(std::vector<std::string>& lines, std::string_view source, int width
     else lines.emplace_back();
 }
 
-void erase_last(std::string& value) {
-    if (value.empty()) return;
-    std::size_t at = value.size() - 1;
+std::size_t previous_codepoint(std::string_view value, std::size_t at) {
+    if (at == 0) return 0;
+    --at;
     while (at > 0 && (static_cast<unsigned char>(value[at]) & 0xc0) == 0x80) --at;
-    value.erase(at);
+    return at;
+}
+
+std::size_t next_codepoint(std::string_view value, std::size_t at) {
+    if (at >= value.size()) return value.size();
+    ++at;
+    while (at < value.size() &&
+           (static_cast<unsigned char>(value[at]) & 0xc0) == 0x80) ++at;
+    return at;
+}
+
+struct EditorPoint {
+    std::size_t offset;
+    int row;
+    int column;
+};
+
+struct EditorLayout {
+    std::vector<std::string> lines{1};
+    std::vector<EditorPoint> points{{0, 0, 0}};
+};
+
+EditorLayout layout_editor(std::string_view value, int width) {
+    EditorLayout layout;
+    width = std::max(1, width);
+    int column = 0;
+    for (std::size_t at = 0; at < value.size();) {
+        const std::size_t start = at;
+        char32_t cp = 0;
+        std::string_view bytes;
+        if (!decode(value, at, cp, bytes)) continue;
+        if (cp == '\n') {
+            layout.lines.emplace_back();
+            column = 0;
+        } else if (printable(cp)) {
+            const int size = cells(cp);
+            if (column + size > width && column > 0) {
+                layout.lines.emplace_back();
+                column = 0;
+                // The same byte offset has a position at either end of the wrap.
+                layout.points.push_back({start, static_cast<int>(layout.lines.size()) - 1, 0});
+            }
+            if (size <= width) {
+                layout.lines.back().append(bytes);
+                column += size;
+            }
+        }
+        layout.points.push_back({at, static_cast<int>(layout.lines.size()) - 1, column});
+    }
+    return layout;
+}
+
+std::size_t point_at(const EditorLayout& layout, std::size_t offset, bool wrap_end) {
+    std::size_t first = 0;
+    std::size_t last = 0;
+    for (std::size_t i = 0; i < layout.points.size(); ++i) {
+        if (layout.points[i].offset == offset) {
+            first = i;
+            last = i;
+            while (last + 1 < layout.points.size() && layout.points[last + 1].offset == offset)
+                ++last;
+            return wrap_end ? first : last;
+        }
+    }
+    return layout.points.size() - 1;
 }
 
 } // namespace
@@ -192,6 +257,10 @@ std::string Tui::start() {
 void Tui::cancel_editor() {
     draft_title_.clear();
     draft_body_.clear();
+    editor_cursor_ = 0;
+    editor_top_ = 0;
+    preferred_column_ = -1;
+    editor_wrap_end_ = false;
     page_ = thread_id_ && page_ == Page::reply_body ? Page::thread : Page::list;
     status_ = "Cancelled";
     dirty_ = true;
@@ -226,14 +295,75 @@ void Tui::key(std::string_view name) {
     if (name == "ctrl-c") { done_ = true; return; }
     if (page_ == Page::new_title || page_ == Page::new_body || page_ == Page::reply_body) {
         if (name == "esc") { cancel_editor(); return; }
-        if (name == "backspace") {
-            erase_last(page_ == Page::new_title ? draft_title_ : draft_body_);
+        std::string& draft = page_ == Page::new_title ? draft_title_ : draft_body_;
+        const auto layout = layout_editor(draft, std::max(1, width_ - 1));
+        const std::size_t current = point_at(layout, editor_cursor_, editor_wrap_end_);
+        const auto set_point = [&](std::size_t index) {
+            editor_cursor_ = layout.points[index].offset;
+            editor_wrap_end_ = index + 1 < layout.points.size() &&
+                layout.points[index + 1].offset == editor_cursor_;
             dirty_ = true;
+        };
+        if (name == "backspace") {
+            const auto left = previous_codepoint(draft, editor_cursor_);
+            draft.erase(left, editor_cursor_ - left);
+            editor_cursor_ = left;
+            editor_wrap_end_ = false;
+            preferred_column_ = -1;
+            dirty_ = true;
+        } else if (name == "delete") {
+            draft.erase(editor_cursor_, next_codepoint(draft, editor_cursor_) - editor_cursor_);
+            editor_wrap_end_ = false;
+            preferred_column_ = -1;
+            dirty_ = true;
+        } else if (name == "left" || name == "right") {
+            editor_cursor_ = name == "left" ? previous_codepoint(draft, editor_cursor_) :
+                                                next_codepoint(draft, editor_cursor_);
+            editor_wrap_end_ = false;
+            preferred_column_ = -1;
+            dirty_ = true;
+        } else if (name == "home" || name == "end" || name == "ctrl-home" ||
+                   name == "ctrl-end") {
+            std::size_t target = name == "ctrl-home" ? 0 :
+                                 name == "ctrl-end" ? layout.points.size() - 1 : current;
+            if (name == "home" || name == "end") {
+                const int row = layout.points[current].row;
+                for (std::size_t i = 0; i < layout.points.size(); ++i) {
+                    if (layout.points[i].row == row) {
+                        target = i;
+                        if (name == "home") break;
+                    }
+                }
+            }
+            set_point(target);
+            preferred_column_ = -1;
+        } else if (name == "up" || name == "down") {
+            if (preferred_column_ < 0) preferred_column_ = layout.points[current].column;
+            const int row = std::clamp(layout.points[current].row + (name == "up" ? -1 : 1),
+                                       0, static_cast<int>(layout.lines.size()) - 1);
+            std::size_t target = current;
+            int distance = 1000000;
+            for (std::size_t i = 0; i < layout.points.size(); ++i) {
+                if (layout.points[i].row != row) continue;
+                const int candidate = std::abs(layout.points[i].column - preferred_column_);
+                if (candidate < distance) { distance = candidate; target = i; }
+            }
+            set_point(target);
         } else if (name == "enter") {
             if (page_ == Page::new_title) {
                 if (draft_title_.empty()) status_ = "Title is empty";
-                else { page_ = Page::new_body; status_.clear(); }
-            } else if (draft_body_.size() < 16384) draft_body_.push_back('\n');
+                else {
+                    page_ = Page::new_body; status_.clear();
+                    editor_cursor_ = 0; editor_top_ = 0;
+                    preferred_column_ = -1; editor_wrap_end_ = false;
+                }
+            } else if (draft_body_.size() < 16384) {
+                draft_body_.insert(editor_cursor_, 1, '\n');
+                ++editor_cursor_;
+                preferred_column_ = -1;
+                editor_wrap_end_ = false;
+                status_.clear();
+            }
             else status_ = "Body limit: 16384 bytes";
             dirty_ = true;
         } else if (name == "ctrl-d" && page_ != Page::new_title) submit();
@@ -250,6 +380,8 @@ void Tui::key(std::string_view name) {
             if (!threads_.empty()) show_thread(threads_[selected_].id);
         } else if (name == "n") {
             page_ = Page::new_title; draft_title_.clear(); draft_body_.clear();
+            editor_cursor_ = 0; editor_top_ = 0;
+            preferred_column_ = -1; editor_wrap_end_ = false;
             status_.clear(); dirty_ = true;
         } else if (name == "r") refresh_list();
         else if (name == "page-up") {
@@ -265,18 +397,29 @@ void Tui::key(std::string_view name) {
         else if (name == "page-down") { thread_scroll_ = std::min(100000, thread_scroll_ + std::max(1, height_ - 2)); dirty_ = true; }
         else if (name == "b") { page_ = Page::list; refresh_list(); }
         else if (name == "r") refresh_thread();
-        else if (name == "a") { page_ = Page::reply_body; draft_body_.clear(); status_.clear(); dirty_ = true; }
+        else if (name == "a") {
+            page_ = Page::reply_body; draft_body_.clear(); status_.clear();
+            editor_cursor_ = 0; editor_top_ = 0;
+            preferred_column_ = -1; editor_wrap_end_ = false;
+            dirty_ = true;
+        }
     }
 }
 
 void Tui::character(std::string_view utf8) {
     if (page_ == Page::new_title) {
         if (draft_title_.size() + utf8.size() <= 120) {
-            draft_title_.append(utf8); status_.clear(); dirty_ = true;
+            draft_title_.insert(editor_cursor_, utf8);
+            editor_cursor_ += utf8.size();
+            preferred_column_ = -1; editor_wrap_end_ = false;
+            status_.clear(); dirty_ = true;
         } else { status_ = "Title limit: 120 bytes"; dirty_ = true; }
     } else if (page_ == Page::new_body || page_ == Page::reply_body) {
         if (draft_body_.size() + utf8.size() <= 16384) {
-            draft_body_.append(utf8); status_.clear(); dirty_ = true;
+            draft_body_.insert(editor_cursor_, utf8);
+            editor_cursor_ += utf8.size();
+            preferred_column_ = -1; editor_wrap_end_ = false;
+            status_.clear(); dirty_ = true;
         } else { status_ = "Body limit: 16384 bytes"; dirty_ = true; }
     } else if (utf8.size() == 1) key(utf8);
 }
@@ -300,8 +443,15 @@ void Tui::byte(unsigned char value) {
             const auto sequence = escape_data_;
             escape_data_.clear();
             escape_ = Escape::none;
-            if (sequence == "A") key("up");
-            else if (sequence == "B") key("down");
+            if (sequence == "A" || sequence == "1;2A" || sequence == "1;5A") key("up");
+            else if (sequence == "B" || sequence == "1;2B" || sequence == "1;5B") key("down");
+            else if (sequence == "C" || sequence == "1;2C" || sequence == "1;5C") key("right");
+            else if (sequence == "D" || sequence == "1;2D" || sequence == "1;5D") key("left");
+            else if (sequence == "H" || sequence == "1~" || sequence == "7~") key("home");
+            else if (sequence == "F" || sequence == "4~" || sequence == "8~") key("end");
+            else if (sequence == "1;5H" || sequence == "1;5~" || sequence == "7;5~") key("ctrl-home");
+            else if (sequence == "1;5F" || sequence == "4;5~" || sequence == "8;5~") key("ctrl-end");
+            else if (sequence == "3~") key("delete");
             else if (sequence == "5~") key("page-up");
             else if (sequence == "6~") key("page-down");
             return;
@@ -371,6 +521,10 @@ std::string Tui::render() {
     dirty_ = false;
     const int content_width = std::max(0, width_ - 1); // Avoid terminal auto-wrap.
     const int content_height = std::max(0, height_ - 2);
+    const bool editing = page_ == Page::new_title || page_ == Page::new_body ||
+                         page_ == Page::reply_body;
+    int cursor_row = 1;
+    int cursor_column = 1;
     std::string header;
     std::string footer;
     std::vector<std::string> content;
@@ -414,12 +568,23 @@ std::string Tui::render() {
         const bool title = page_ == Page::new_title;
         header = title ? "New thread | Title" :
                  page_ == Page::new_body ? "New thread | Body" : "Reply | Body";
-        footer = title ? "Enter: next  Esc: cancel  Max 120 bytes" :
-                  "Enter: newline  Ctrl+D: submit  Esc: cancel  Max 16384 bytes";
-        if (title) wrapped(content, draft_title_ + "_", content_width);
-        else wrapped(content, draft_body_ + "_", content_width);
-        if (static_cast<int>(content.size()) > content_height && content_height > 0)
-            content.erase(content.begin(), content.end() - content_height);
+        footer = title ? "Arrows: move  Enter: next  Esc: cancel  Max 120 bytes" :
+                  "Arrows: move  Enter: newline  Ctrl+D: submit  Esc: cancel  Max 16384 bytes";
+        const auto layout = layout_editor(title ? draft_title_ : draft_body_,
+                                          std::max(1, content_width));
+        const auto& caret = layout.points[point_at(layout, editor_cursor_, editor_wrap_end_)];
+        if (content_height > 0) {
+            editor_top_ = std::clamp(editor_top_, 0,
+                std::max(0, static_cast<int>(layout.lines.size()) - content_height));
+            if (caret.row < editor_top_) editor_top_ = caret.row;
+            if (caret.row >= editor_top_ + content_height)
+                editor_top_ = caret.row - content_height + 1;
+            for (int row = editor_top_; row < static_cast<int>(layout.lines.size()) &&
+                 static_cast<int>(content.size()) < content_height; ++row)
+                content.push_back(layout.lines[row]);
+            cursor_row = 2 + caret.row - editor_top_;
+            cursor_column = std::clamp(caret.column + 1, 1, width_);
+        }
     }
     if (!status_.empty()) footer = status_ + " | " + footer;
     std::string screen = "\x1b[H\x1b[2J";
@@ -433,6 +598,10 @@ std::string Tui::render() {
         screen += "\x1b[K";
         if (row + 1 < height_) screen += "\r\n";
     }
+    if (editing && content_height > 0) {
+        screen += "\x1b[" + std::to_string(cursor_row) + ";" +
+                  std::to_string(cursor_column) + "H\x1b[?25h";
+    } else screen += "\x1b[?25l";
     return screen;
 }
 

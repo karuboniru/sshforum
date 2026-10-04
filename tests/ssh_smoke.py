@@ -11,6 +11,7 @@ import contextlib
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -293,6 +294,40 @@ def check_navigation(port: int, marker: str) -> None:
         pager.send_and_expect("k", "SSH Forum | Threads")
 
 
+def check_editor(port: int, marker: str, database: Path) -> None:
+    title = f"SMOKE_EDIT_{marker}_甲乙"
+    with contextlib.closing(Terminal(port, "none")) as editor:
+        screen = editor.send_and_expect("n", "New thread")
+        assert b"\x1b[?25h" in screen, "editor did not show the terminal cursor"
+        editor.send(f"SMOKE_EDIT_{marker}_甲丙")
+        # Split a left-arrow sequence across SSH writes, then insert/delete
+        # whole UTF-8 characters in the middle of the title.
+        for part in (b"\x1b", b"[", b"D"):
+            editor.send(part)
+            time.sleep(0.01)
+        editor.send("乙\x1b[3~\x1b[HX\x7f\x1b[F\r")
+        editor.send("AB\r甲乙")
+        editor.send("\x1b[H\x1b[3~中\x1b[A!\x1b[B\x1b[F\x1b[D\x7f甲")
+        # Insert a newline between A and B, preserving the following lines.
+        editor.send("\x1b[H\x1b[A\x1b[C\r")
+        editor.send_and_expect(b"\x04", title)
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT id, body FROM threads WHERE title = ?", (title,)
+            ).fetchone()
+        assert row is not None, "edited title was not saved correctly"
+        thread_id, body = row
+        assert body == "A\nB!\n甲乙", f"cursor editing saved unexpected body: {body!r}"
+
+        editor.send("a回丙\x1b[D帖\x1b[3~")
+        editor.send_and_expect(b"\x04", "回帖")
+        with sqlite3.connect(database) as connection:
+            replies = connection.execute(
+                "SELECT body FROM posts WHERE thread_id = ? ORDER BY id", (thread_id,)
+            ).fetchall()
+        assert replies == [("回帖",)], f"reply editing saved unexpected text: {replies!r}"
+
+
 def run(binary: Path) -> None:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SystemExit(f"server binary is not executable: {binary}")
@@ -353,6 +388,7 @@ def run(binary: Path) -> None:
                 persisted.send_and_expect("\r", reply_a)
                 persisted.send_and_expect("r", reply_b)
             check_navigation(server.port, marker)
+            check_editor(server.port, marker, directory / "forum.db")
             print("SSH smoke test passed")
         except BaseException:
             server.stop()

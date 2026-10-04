@@ -161,10 +161,125 @@ void test_limits_and_paging() {
             "editor should enforce Store byte limits");
 }
 
+void test_cursor_editing_and_reply() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    sshforum::Tui tui(store);
+    tui.resize(24, 8);
+    tui.start();
+    require(tui.input("n").find("\x1b[2;1H\x1b[?25h") != std::string::npos,
+            "editor should show the real cursor at the insertion point");
+    tui.input("甲乙丙");
+    tui.input("\x1bOD\x1b[D"); // SS3 and CSI left arrows.
+    tui.input("中");
+    tui.input("\x1b[3~"); // Delete 乙 to the right.
+    tui.input("\x7f"); // Backspace 中 to the left.
+    tui.input("\x1b[H头\x1b[F尾");
+    tui.input("\r");
+    tui.input("甲a\n12345\n乙b");
+    tui.input("\x1b[A"); // Keep display column 3, before '4'.
+    tui.input("X");
+    tui.input("\x1b[1;5H"); // Beginning of body.
+    tui.input("前");
+    tui.input("\x1b[1;5F"); // End of body.
+    tui.input("后");
+    tui.input("\x04");
+    const auto listed = store.list_threads();
+    require(listed.size() == 1 && listed.front().title == "头甲丙尾",
+            "middle insert, Delete, Backspace, Home and End should edit title by codepoint");
+    require(listed.front().body == "前甲a\n123X45\n乙b后",
+            "up arrow should follow display cells and Ctrl+Home/End should reach body edges");
+
+    tui.input("a");
+    tui.input("甲乙\n尾");
+    tui.input("\x1b[A"); // From display column 2 to between 甲 and 乙.
+    tui.input("中");
+    tui.input("\x1b[3~");
+    tui.input("\x04");
+    const auto thread = store.get_thread(listed.front().id);
+    require(thread && thread->replies.size() == 1 &&
+            thread->replies.front().body == "甲中\n尾",
+            "reply editor should share Unicode cursor editing and Delete behavior");
+    require(tui.input("b").find("\x1b[?25l") != std::string::npos,
+            "browser should hide the terminal cursor");
+}
+
+void test_wrap_viewport_and_resize() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    sshforum::Tui tui(store);
+    tui.resize(6, 4); // Five editable cells and two visible editor rows.
+    tui.start();
+    tui.input("nT\r");
+    tui.input("abcdef");
+    auto screen = tui.input("\x1b[H"); // Home on second visual row.
+    require(screen.find("\x1b[3;1H\x1b[?25h") != std::string::npos,
+            "Home should move to the start of a wrapped display row");
+    screen = tui.input("\x1b[A\x1b[F"); // Up, then End of first visual row.
+    require(screen.find("\x1b[2;6H\x1b[?25h") != std::string::npos,
+            "End should reach the wrap boundary without moving to the next row");
+    screen = tui.input("\x1b[C");
+    require(screen.find("\x1b[3;2H\x1b[?25h") != std::string::npos,
+            "right arrow should advance one codepoint across the wrap");
+    screen = tui.input("ghijk");
+    require(screen.find("fghij") != std::string::npos &&
+            screen.find("abcde") == std::string::npos &&
+            screen.find("\x1b[3;2H\x1b[?25h") != std::string::npos,
+            "viewport should follow the cursor through soft wraps");
+    screen = tui.input("\x1b[1;5H");
+    require(screen.find("abcde") != std::string::npos &&
+            screen.find("\x1b[2;1H\x1b[?25h") != std::string::npos,
+            "Ctrl+Home should scroll the viewport back to the first row");
+    tui.resize(10, 5);
+    screen = tui.input("");
+    require(screen.find("\x1b[2;1H\x1b[?25h") != std::string::npos,
+            "resize should keep the editor cursor visible");
+    tui.input("\x04");
+    require(store.list_threads().front().body == "abcdefghijk",
+            "navigation and viewport should not alter the draft");
+}
+
+void test_middle_insertion_byte_limits() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    sshforum::Tui tui(store);
+    tui.start();
+    tui.input("n");
+    tui.input(std::string(119, 't'));
+    tui.input("\x1b[1;5H");
+    require(tui.input("中").find("Title limit: 120 bytes") != std::string::npos,
+            "UTF-8 insertion must count title bytes at the cursor");
+    tui.input("x");
+    require(tui.input("\x1b[F").find("\x1b[2;80H\x1b[?25h") != std::string::npos,
+            "End should locate the last cell of a long title's visual row");
+    tui.input("\x1b[1;5F");
+    tui.resize(20, 5);
+    require(tui.input("").find("\x1b[4;7H\x1b[?25h") != std::string::npos,
+            "resizing a long title should keep its cursor in the visible viewport");
+    tui.input("\r");
+    tui.resize(50, 5);
+    tui.input(std::string(16382, 'b'));
+    tui.input("\x1b[1;5H");
+    require(tui.input("中").find("Body limit: 16384 bytes") != std::string::npos,
+            "UTF-8 insertion must count body bytes at the cursor");
+    tui.input("x\n");
+    require(tui.input("y").find("Body limit: 16384 bytes") != std::string::npos,
+            "newline inserted in the middle must use one byte of body limit");
+    tui.input("\x04");
+    const auto latest = store.list_threads().front();
+    require(latest.title.size() == 120 && latest.title.front() == 'x',
+            "title insertion at byte limit should preserve the cursor position");
+    require(latest.body.size() == 16384 && latest.body.starts_with("x\n"),
+            "body insertion at byte limit should preserve UTF-8 boundaries");
+}
+
 } // namespace
 
 int main() {
     test_post_reply_and_utf8();
     test_escape_keys_and_sanitization();
     test_limits_and_paging();
+    test_cursor_editing_and_reply();
+    test_wrap_viewport_and_resize();
+    test_middle_insertion_byte_limits();
 }

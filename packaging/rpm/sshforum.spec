@@ -56,6 +56,7 @@ ctest --test-dir %{_vpath_builddir} --output-on-failure
 %changelog
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-2
 - Remove fragile configuration-file bind mounts under SELinux
+- Add UTF-8 cursor movement, insertion and deletion to post editors
 
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-1
 - Initial RPM package

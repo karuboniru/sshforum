@@ -3,6 +3,7 @@
 #include "sshforum/store.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -45,6 +46,10 @@ private:
     Thread thread_{};
     std::string draft_title_;
     std::string draft_body_;
+    std::size_t editor_cursor_ = 0;
+    int editor_top_ = 0;
+    int preferred_column_ = -1;
+    bool editor_wrap_end_ = false;
     std::string status_;
 
     void refresh_list();
