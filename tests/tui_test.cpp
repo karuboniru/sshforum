@@ -1,11 +1,15 @@
 #include "sshforum/store.hpp"
 #include "sshforum/tui.hpp"
 
+#include <sqlite3.h>
+
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -22,6 +26,47 @@ std::size_t count_occurrences(const std::string& text, const std::string& needle
     for (std::size_t at = text.find(needle); at != std::string::npos;
          at = text.find(needle, at + needle.size())) ++count;
     return count;
+}
+
+void execute_sql(const std::string& path, const std::string& sql) {
+    sqlite3* database = nullptr;
+    if (sqlite3_open(path.c_str(), &database) != SQLITE_OK) {
+        const std::string message = database ? sqlite3_errmsg(database) : "open failed";
+        sqlite3_close(database);
+        throw std::runtime_error(message);
+    }
+    char* error = nullptr;
+    const int result = sqlite3_exec(database, sql.c_str(), nullptr, nullptr, &error);
+    if (result != SQLITE_OK) {
+        const std::string message = error ? error : sqlite3_errmsg(database);
+        sqlite3_free(error);
+        sqlite3_close(database);
+        throw std::runtime_error(message);
+    }
+    sqlite3_close(database);
+}
+
+std::vector<std::string> screen_rows(const std::string& screen) {
+    constexpr std::string_view clear = "\x1b[H\x1b[2J";
+    const auto begin = screen.find(clear);
+    require(begin != std::string::npos, "screen should contain a clear sequence");
+    std::vector<std::string> rows;
+    std::size_t at = begin + clear.size();
+    for (;;) {
+        const auto end = screen.find("\x1b[K", at);
+        require(end != std::string::npos, "every screen row should clear its remainder");
+        rows.push_back(screen.substr(at, end - at));
+        at = end + 3;
+        if (screen.compare(at, 2, "\r\n") != 0) break;
+        at += 2;
+    }
+    return rows;
+}
+
+std::size_t find_row(const std::vector<std::string>& rows, const std::string& needle) {
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].find(needle) != std::string::npos) return i;
+    throw std::runtime_error("screen row missing: " + needle);
 }
 
 class TemporaryDatabase {
@@ -209,11 +254,20 @@ void test_limits_and_paging() {
     tui.resize(50, 5);
     tui.start();
     const auto paged = tui.input("\x1b[6~");
-    require(paged.find("> topic 2") != std::string::npos,
+    require(paged.find("> topic 4") != std::string::npos,
             "PageDown should move one visible page in list");
     const auto reset = tui.input("\x1b[5~");
     require(reset.find("> topic 5") != std::string::npos,
             "PageUp should return to first thread");
+
+    tui.resize(30, 3); // Only one content row fits; navigation must still work.
+    const auto tiny = tui.input("j");
+    require(tiny.find("topic 4") != std::string::npos,
+            "a one-row viewport should still show the selected thread");
+    require(tui.input("\r").find("Thread #") != std::string::npos,
+            "a thread should remain openable from a one-row viewport");
+    tui.input("b");
+    tui.resize(50, 5);
 
     tui.input("n");
     tui.input(std::string(120, 'x'));
@@ -227,6 +281,78 @@ void test_limits_and_paging() {
     auto latest = store.list_threads().front();
     require(latest.title.size() == 120 && latest.body.size() == 16384,
             "editor should enforce Store byte limits");
+}
+
+void test_list_relative_times_and_alignment() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    const auto no_reply_id = store.create_thread("Recent topic", "recent body");
+    const auto replied_id = store.create_thread("Older topic", "older body");
+    store.reply(replied_id, "older reply");
+    execute_sql(database.path(),
+        "UPDATE threads SET created_at = "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours', '-30 minutes', '-20 seconds') "
+        "WHERE id = " + std::to_string(no_reply_id));
+    execute_sql(database.path(),
+        "UPDATE threads SET created_at = "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days', '-2 hours') "
+        "WHERE id = " + std::to_string(replied_id));
+    execute_sql(database.path(),
+        "UPDATE posts SET created_at = "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day', '-5 hours') "
+        "WHERE thread_id = " + std::to_string(replied_id));
+
+    sshforum::Tui tui(store);
+    tui.resize(60, 8);
+    const auto rows = screen_rows(tui.start());
+    const auto recent = find_row(rows, "Recent topic");
+    const auto older = find_row(rows, "Older topic");
+    require(recent + 1 < rows.size() && older + 1 < rows.size(),
+            "each list item should have two visible rows");
+    const auto first = std::min(recent, older);
+    const auto second = std::max(recent, older);
+    require(second == first + 3 && rows[first + 2].empty(),
+            "one blank row should separate list entries");
+    require(rows[recent].starts_with("  Recent topic") &&
+            rows[recent].ends_with("Posted: 2h 30m ago") &&
+            rows[recent].size() == 59,
+            "recent thread title and posted age should occupy opposite ends of the first row");
+    require(rows[recent + 1].starts_with("  [0 replies]") &&
+            rows[recent + 1].ends_with("Last reply: No replies yet") &&
+            rows[recent + 1].size() == 59,
+            "a thread without replies should show its count and last-reply text on one row");
+    require(rows[older].find("Older topic") != std::string::npos &&
+            rows[older].ends_with("Posted: 3d ago") && rows[older].size() == 59,
+            "posted ages of at least 24 hours should use days on the right edge");
+    require(rows[older + 1].starts_with("  [1 replies]") &&
+            rows[older + 1].ends_with("Last reply: 1d ago") &&
+            rows[older + 1].size() == 59,
+            "the second row should use the latest reply's day age");
+}
+
+void test_message_separators() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path());
+    store.create_thread("Separation", "original message");
+    const auto id = store.list_threads().front().id;
+    store.reply(id, "first response");
+    store.reply(id, "second response");
+
+    sshforum::Tui tui(store);
+    tui.resize(32, 30);
+    tui.start();
+    const auto rows = screen_rows(tui.input("\r"));
+    const auto original = find_row(rows, "original message");
+    const auto first = find_row(rows, "first response");
+    const auto second = find_row(rows, "second response");
+    const std::string separator(31, '-');
+    std::vector<std::size_t> separators;
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (rows[i] == separator) separators.push_back(i);
+    require(separators.size() == 2 &&
+            original < separators[0] && separators[0] < first &&
+            first < separators[1] && separators[1] < second,
+            "a full content-width separator should appear between each pair of messages");
 }
 
 void test_cursor_editing_and_reply() {
@@ -348,6 +474,8 @@ int main() {
     test_stable_author_identity();
     test_escape_keys_and_sanitization();
     test_limits_and_paging();
+    test_list_relative_times_and_alignment();
+    test_message_separators();
     test_cursor_editing_and_reply();
     test_wrap_viewport_and_resize();
     test_middle_insertion_byte_limits();

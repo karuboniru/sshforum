@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <string>
@@ -76,6 +78,38 @@ std::string fit(std::string_view source, int width) {
         }
     }
     return out;
+}
+
+int display_width(std::string_view text) {
+    int width = 0;
+    for (std::size_t at = 0; at < text.size();) {
+        char32_t cp = 0;
+        std::string_view bytes;
+        if (decode(text, at, cp, bytes) && printable(cp)) width += cells(cp);
+    }
+    return width;
+}
+
+std::string aligned(std::string_view left, std::string_view right, int width) {
+    const auto rhs = fit(right, width);
+    const int right_width = display_width(rhs);
+    const auto lhs = fit(left, std::max(0, width - right_width - 2));
+    return lhs + std::string(std::max(0, width - display_width(lhs) - right_width), ' ') + rhs;
+}
+
+std::string relative_time(std::string_view timestamp, std::chrono::system_clock::time_point now) {
+    using namespace std::chrono;
+    int y, mo, d, h, mi, sec;
+    const std::string text(timestamp);
+    if (std::sscanf(text.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &sec) != 6)
+        return "unknown";
+    const year_month_day date{year{y}, month{static_cast<unsigned>(mo)}, day{static_cast<unsigned>(d)}};
+    if (!date.ok() || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59)
+        return "unknown";
+    const auto posted = sys_days{date} + hours{h} + minutes{mi} + seconds{sec};
+    const auto age = std::max<std::int64_t>(0, duration_cast<minutes>(now - posted).count());
+    if (age >= 24 * 60) return std::to_string(age / (24 * 60)) + "d ago";
+    return std::to_string(age / 60) + "h " + std::to_string(age % 60) + "m ago";
 }
 
 void wrapped(std::vector<std::string>& lines, std::string_view source, int width,
@@ -391,10 +425,10 @@ void Tui::key(std::string_view name) {
             status_.clear(); dirty_ = true;
         } else if (name == "r") refresh_list();
         else if (name == "page-up") {
-            selected_ = std::max(0, selected_ - std::max(1, height_ - 2)); dirty_ = true;
+            selected_ = std::max(0, selected_ - std::max(1, (height_ - 1) / 3)); dirty_ = true;
         } else if (name == "page-down") {
             selected_ = std::min(std::max(0, static_cast<int>(threads_.size()) - 1),
-                                 selected_ + std::max(1, height_ - 2)); dirty_ = true;
+                                 selected_ + std::max(1, (height_ - 1) / 3)); dirty_ = true;
         }
     } else if (page_ == Page::thread) {
         if (name == "up" || name == "k") { thread_scroll_ = std::max(0, thread_scroll_ - 1); dirty_ = true; }
@@ -540,14 +574,20 @@ std::string Tui::render() {
         footer = "j/k: move  PgUp/PgDn: page  Enter: open  n: new  r: refresh  q: quit";
         if (threads_.empty()) content.emplace_back("No threads yet. Press n to post.");
         else {
+            const int visible_threads = std::max(1, (content_height + 1) / 3);
+            const auto now = std::chrono::system_clock::now();
             if (selected_ < list_top_) list_top_ = selected_;
-            if (selected_ >= list_top_ + std::max(1, content_height))
-                list_top_ = selected_ - std::max(1, content_height) + 1;
+            if (selected_ >= list_top_ + visible_threads)
+                list_top_ = selected_ - visible_threads + 1;
             for (int i = list_top_; i < static_cast<int>(threads_.size()) &&
-                 static_cast<int>(content.size()) < content_height; ++i) {
+                 i < list_top_ + visible_threads; ++i) {
                 const auto& item = threads_[i];
-                content.push_back(std::string(i == selected_ ? "> " : "  ") +
-                                  item.title + "  [" + std::to_string(item.reply_count) + " replies]");
+                content.push_back(aligned(std::string(i == selected_ ? "> " : "  ") + item.title,
+                    "Posted: " + relative_time(item.created_at, now), content_width));
+                content.push_back(aligned("  [" + std::to_string(item.reply_count) + " replies]",
+                    "Last reply: " + (item.last_reply_at.empty() ? std::string("No replies yet") :
+                                     relative_time(item.last_reply_at, now)), content_width));
+                content.emplace_back();
             }
         }
     } else if (page_ == Page::thread) {
@@ -560,14 +600,13 @@ std::string Tui::render() {
         wrapped(content, display_author(thread_.summary.author_id), content_width);
         content.emplace_back();
         wrapped(content, thread_.summary.body, content_width);
-        content.emplace_back();
         for (const auto& reply : thread_.replies) {
             if (content.size() >= 100000) break;
+            content.emplace_back(static_cast<std::size_t>(content_width), '-');
             wrapped(content, display_author(reply.author_id) + "  Reply #" +
                              std::to_string(reply.id), content_width);
             wrapped(content, "Posted: " + reply.created_at, content_width);
             wrapped(content, reply.body, content_width);
-            content.emplace_back();
         }
         thread_scroll_ = std::clamp(thread_scroll_, 0,
             std::max(0, static_cast<int>(content.size()) - content_height));

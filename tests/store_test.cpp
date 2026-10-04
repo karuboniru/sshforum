@@ -125,7 +125,11 @@ void test_crud_and_persistence() {
         require(thread->summary.body == "Opening post", "opening post should be preserved");
         require(!thread->summary.created_at.empty(), "thread timestamp should be populated");
         require(thread->summary.reply_count == 0, "a new thread should have no replies");
+        require(thread->summary.last_reply_at.empty(), "a new thread should have no reply timestamp");
         require(thread->replies.empty(), "a new thread should have an empty reply list");
+        const auto initial_summaries = store.list_threads();
+        require(initial_summaries.size() == 1 && initial_summaries.front().last_reply_at.empty(),
+                "listing a thread without replies should have no reply timestamp");
 
         reply_id = store.reply(thread_id, "First reply");
         require(reply_id > 0, "created replies should have positive IDs");
@@ -136,6 +140,10 @@ void test_crud_and_persistence() {
         require(thread->replies.front().thread_id == thread_id, "reply should belong to its thread");
         require(thread->replies.front().body == "First reply", "reply body should be preserved");
         require(!thread->replies.front().created_at.empty(), "reply timestamp should be populated");
+        require(thread->summary.last_reply_at == thread->replies.front().created_at,
+                "thread detail should include its latest reply timestamp");
+        require(store.list_threads().front().last_reply_at == thread->replies.front().created_at,
+                "thread listing should include its latest reply timestamp");
     }
 
     {
@@ -147,6 +155,8 @@ void test_crud_and_persistence() {
         require(thread->summary.reply_count == 1, "reopened reply count should match");
         require(thread->replies.size() == 1 && thread->replies.front().id == reply_id,
                 "reply should survive reopening the database");
+        require(thread->summary.last_reply_at == thread->replies.front().created_at,
+                "latest reply timestamp should survive reopening the database");
         require(reopened.list_threads().size() == 1, "listing should survive reopening the database");
     }
 }
@@ -224,6 +234,32 @@ void test_latest_reply_sorting_and_limit() {
     threads = store.list_threads(1);
     require(threads.size() == 1 && threads.front().id == first_id,
             "list limit should return the first thread in sort order");
+}
+
+void test_latest_reply_timestamp_uses_reply_id() {
+    TemporaryDatabase database;
+    sshforum::Store store(database.path().string());
+    const auto thread_id = store.create_thread("Timestamp order", "Opening post");
+    store.reply(thread_id, "First reply");
+    store.reply(thread_id, "Second reply");
+
+    {
+        RawDatabase raw(database.path());
+        raw.execute("UPDATE posts SET created_at = '2030-01-01T00:00:00.000Z' "
+                    "WHERE body = 'First reply'");
+        raw.execute("UPDATE posts SET created_at = '2020-01-01T00:00:00.000Z' "
+                    "WHERE body = 'Second reply'");
+    }
+
+    const std::string latest_timestamp = "2020-01-01T00:00:00.000Z";
+    const auto detail = store.get_thread(thread_id);
+    require(detail && detail->replies.size() == 2 &&
+                detail->summary.last_reply_at == detail->replies.back().created_at &&
+                detail->summary.last_reply_at == latest_timestamp,
+            "thread detail should use the timestamp of the highest reply ID");
+    const auto summaries = store.list_threads();
+    require(summaries.size() == 1 && summaries.front().last_reply_at == latest_timestamp,
+            "thread listing should use the timestamp of the highest reply ID");
 }
 
 void test_legacy_migration_and_identity_secret() {
@@ -385,6 +421,7 @@ int main() {
         test_validation_and_missing_thread();
         test_sql_metacharacters();
         test_latest_reply_sorting_and_limit();
+        test_latest_reply_timestamp_uses_reply_id();
         test_legacy_migration_and_identity_secret();
         test_future_version_is_untouched();
         std::cout << "store tests passed\n";

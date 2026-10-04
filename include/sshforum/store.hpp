@@ -15,6 +15,7 @@ struct ThreadSummary {
     std::string created_at;
     std::int64_t reply_count;
     std::string author_id{};
+    std::string last_reply_at{};
 };
 
 struct Post {

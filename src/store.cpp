@@ -166,7 +166,7 @@ bool has_column(sqlite3* db, const char* table_info_sql, std::string_view name) 
 
 ThreadSummary read_summary(const Statement& statement) {
     return {statement.integer(0), statement.text(1), statement.text(2),
-            statement.text(3), statement.integer(4), statement.text(5)};
+            statement.text(3), statement.integer(4), statement.text(5), statement.text(6)};
 }
 
 std::int64_t next_activity(sqlite3* db) {
@@ -271,7 +271,10 @@ std::vector<ThreadSummary> Store::list_threads(int limit) {
 
     std::lock_guard lock(impl_->mutex);
     Statement statement(impl_->db,
-                        "SELECT id, title, body, created_at, reply_count, author_id FROM threads "
+                        "SELECT id, title, body, created_at, reply_count, author_id, "
+                        "COALESCE((SELECT created_at FROM posts "
+                        "WHERE thread_id = threads.id ORDER BY id DESC LIMIT 1), '') "
+                        "FROM threads "
                         "ORDER BY activity_sequence DESC LIMIT ?1");
     statement.bind(1, static_cast<std::int64_t>(limit));
     std::vector<ThreadSummary> threads;
@@ -287,7 +290,9 @@ std::optional<Thread> Store::get_thread(std::int64_t id) {
     std::optional<Thread> thread;
     {
         Statement statement(impl_->db,
-                            "SELECT id, title, body, created_at, reply_count, author_id "
+                            "SELECT id, title, body, created_at, reply_count, author_id, "
+                            "COALESCE((SELECT created_at FROM posts "
+                            "WHERE thread_id = threads.id ORDER BY id DESC LIMIT 1), '') "
                             "FROM threads WHERE id = ?1");
         statement.bind(1, id);
         if (statement.step() == SQLITE_ROW) {
