@@ -26,12 +26,12 @@ MemoryHigh=192M
 MemoryMax=256M
 CPUQuota=100%
 
-# StateDirectory= bind-mounts the persistent directory back through the empty
-# /var tree. SQLite must be able to create its WAL and shared-memory sidecars.
+# Keep the host filesystem read-only, with persistent writes confined to
+# StateDirectory. SQLite must be able to create its WAL and shared-memory files.
+# Do not overlay /etc or bind individual configuration files: creating those
+# mount targets can fail under Fedora SELinux before the application starts.
 ProtectSystem=strict
 ReadWritePaths=/var/lib/sshforum
-TemporaryFileSystem=/etc:ro /var:ro /run:ro
-BindReadOnlyPaths=/etc/ld.so.cache /etc/pki/tls/openssl.cnf -/etc/pki/tls/openssl.d /etc/crypto-policies
 ProtectHome=yes
 InaccessiblePaths=-/boot -/efi -/opt -/srv -/mnt -/media
 PrivateTmp=yes

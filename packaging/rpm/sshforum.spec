@@ -1,6 +1,6 @@
 Name:           sshforum
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Anonymous SSH terminal forum
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
@@ -54,5 +54,8 @@ ctest --test-dir %{_vpath_builddir} --output-on-failure
 %{_unitdir}/sshforum.service
 
 %changelog
+* Sun Oct 04 2026 sshforum contributors - 0.1.0-2
+- Remove fragile configuration-file bind mounts under SELinux
+
 * Sun Oct 04 2026 sshforum contributors - 0.1.0-1
 - Initial RPM package

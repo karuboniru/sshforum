@@ -20,7 +20,7 @@ bash scripts/build-srpm.sh
 ```text
 dist/rpmbuild/SOURCES/sshforum-0.1.0.tar.gz
 dist/rpmbuild/SPECS/sshforum.spec
-dist/rpmbuild/SRPMS/sshforum-0.1.0-1.*.src.rpm
+dist/rpmbuild/SRPMS/sshforum-0.1.0-2.*.src.rpm
 ```
 
 源码归档使用显式文件清单，包含代码、测试、安装文档、unit、spec 和构建脚本；不包含 `data/`、数据库、主机密钥、构建目录或 Git 元数据。脚本检查 CMake/spec 版本一致，归档文件时间由 `SOURCE_DATE_EPOCH` 控制，默认归零；这不承诺整个 SRPM/RPM 二进制完全可复现。
@@ -30,7 +30,7 @@ dist/rpmbuild/SRPMS/sshforum-0.1.0-1.*.src.rpm
 ```bash
 toolbox run -c fedora-toolbox-45 rpmbuild --rebuild \
   --define "_topdir $PWD/dist/rpmbuild" \
-  dist/rpmbuild/SRPMS/sshforum-0.1.0-1.*.src.rpm
+  dist/rpmbuild/SRPMS/sshforum-0.1.0-2.*.src.rpm
 ```
 
 `%check` 会运行 SQLite、TUI 和真实 SSH 测试；测试使用临时目录和随机高端口。输出在 `dist/rpmbuild/RPMS/`。目标系统版本不同，应使用匹配目标 Fedora 版本的 toolbox 和 `TOOLBOX_CONTAINER=容器名` 构建，不应直接安装为更新 glibc/libssh 构建的包。
@@ -40,7 +40,7 @@ toolbox run -c fedora-toolbox-45 rpmbuild --rebuild \
 普通 Fedora 宿主机上安装主包（不必安装 debuginfo/debugsource）：
 
 ```bash
-sudo dnf install ./dist/rpmbuild/RPMS/$(uname -m)/sshforum-0.1.0-1.*.$(uname -m).rpm
+sudo dnf install ./dist/rpmbuild/RPMS/$(uname -m)/sshforum-0.1.0-2.*.$(uname -m).rpm
 sudo systemctl enable --now sshforum.service
 systemctl status sshforum.service
 sudo journalctl -u sshforum.service -f
@@ -77,7 +77,33 @@ sudo systemctl enable --now sshforum.service
 
 `DynamicUser=yes` 配合 `StateDirectory=sshforum` 保留数据，同时避免将持久文件暴露给之后重用该 UID 的进程。`ProtectSystem=strict` 将宿主文件系统只读化，持久写入仅允许论坛 state 目录；`PrivateTmp` 提供隔离的临时文件空间。
 
-只读不是隐藏：unit 另外用空的只读 tmpfs 覆盖 `/etc`、`/var`、`/run`，再绑定必要的动态加载器缓存、OpenSSL 配置、系统加密策略和论坛 state 目录。家目录以及 `/boot`、`/efi`、`/opt`、`/srv`、`/mnt`、`/media` 被隐藏或禁止访问。`/usr` 的运行库和公共资源仍可读取；这是依赖宿主运行库的隔离服务，不是包含独立最小文件系统的虚拟机。
+服务不再用 tmpfs 覆盖 `/etc`、`/var`、`/run`，也不再逐个 bind 系统配置文件。DynamicUser 仍受普通 Unix 权限和 SELinux 限制；普通用户本就可读的系统配置与公共文件现在也对服务可读。家目录以及 `/boot`、`/efi`、`/opt`、`/srv`、`/mnt`、`/media` 仍被隐藏或禁止访问。`ProtectSystem=strict` 保护写入，并不宣称隐藏所有可读文件。
+
+`0.1.0-2` 移除了这层配置文件白名单，以避免 Fedora SELinux 拒绝 systemd 的 `init_t` 域在临时 `/etc` 中创建 `ld_so_cache_t` 挂载目标，进而触发 `226/NAMESPACE`。见 [systemd 上游同类问题](https://github.com/systemd/systemd/issues/36224)。无需关闭 SELinux、改策略或安装额外目录骨架。
+
+已安装旧版时，可先用 drop-in 修复，不必重建程序：
+
+```bash
+sudo systemctl edit sshforum.service
+```
+
+写入以下内容以清空旧 unit 的列表设置：
+
+```ini
+[Service]
+TemporaryFileSystem=
+BindReadOnlyPaths=
+```
+
+然后执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart sshforum.service
+sudo journalctl -u sshforum.service -n 30 --no-pager
+```
+
+这不会改变论坛数据或主机密钥。新版 RPM 已直接移除这些设置；升级后可以仅删除上述临时 drop-in 中的两行，保留其他本地设置。在 Fedora 44 上重建 SRPM 会得到 `.fc44` 包，不要安装为 Fedora 45 运行库构建的 `.fc45` 二进制包。
 
 其余约束包括清空 capabilities、禁止提权、私有设备、禁用可写可执行内存、限制命名空间和系统调用、保护内核与 cgroup，并隐藏其他用户的进程。服务无需系统 shell、设备访问、系统 SSH 配置或用户凭据。
 
